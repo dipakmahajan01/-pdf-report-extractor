@@ -6,7 +6,7 @@ Upload a lab report PDF (digital **or scanned**), extract every test parameter, 
 
 > **Demo video:** _add link here_ (3–5 min: upload, digital + scanned PDF, duplicate, bad file, failed scan + retry)
 
-Design documents: [High-Level Design](docs/HLD.md) · [Low-Level Design](docs/LLD.md)
+Design documents: [High-Level Design](docs/HLD.md) · [Low-Level Design](docs/LLD.md) · [Test case sheet](docs/Test_Cases.xlsx)
 
 ---
 

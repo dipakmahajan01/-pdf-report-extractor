@@ -1,0 +1,15 @@
+{
+  "name": "sample-generator",
+  "version": "1.0.0",
+  "description": "",
+  "scripts": {
+    "generate": "node generate-samples.js"
+  },
+  "keywords": [],
+  "type": "module",
+  "private": true,
+  "dependencies": {
+    "@napi-rs/canvas": "^1.2.0",
+    "pdfkit": "^0.21.0"
+  }
+}

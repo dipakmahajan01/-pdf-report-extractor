@@ -1,0 +1,20 @@
+# dependencies
+node_modules/
+
+# build output
+dist/
+.next/
+coverage/
+
+# secrets
+.env
+.env.local
+
+# uploaded PDFs (runtime data)
+backend/storage/
+
+# logs
+*.log
+
+# assignment brief (not part of the solution)
+Technical_Assignment_Full_Stack.pdf

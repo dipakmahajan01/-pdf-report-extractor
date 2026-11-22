@@ -538,7 +538,6 @@ Request: `multipart/form-data`, field `file`.
     "parseScore": 1,
     "warnings": [],
     "rawText": "--- page 1 (text) ---\n…",
-    "parameterCount": 8,
     "createdAt": "…",
     "parameters": [
       { "rowOrder": 2, "pageNumber": 1, "isSection": false, "sectionName": null,

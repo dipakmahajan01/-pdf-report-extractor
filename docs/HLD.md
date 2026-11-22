@@ -3,18 +3,14 @@
 | Item | Detail |
 |---|---|
 | Project | PDF Report Data Extraction (Problem Statement 1) |
-| Stack | Next.js (frontend) · NestJS (backend) · PostgreSQL (database) |
+| Stack | Next.js 16 (frontend) · NestJS 12 (backend) · PostgreSQL (database) |
 | PDF reading | `pdfjs-dist` (digital PDFs) · `tesseract.js` LSTM OCR (scanned PDFs) |
-| ORM | Prisma |
-| Version | 1.0 |
+| ORM | **TypeORM** (entities + plain-SQL migration) |
+| Tests | Vitest (NestJS 12 is ESM-only) |
+| Version | 1.1 (matches the implemented system) |
 
+> **Change from the first draft:** the plan used Prisma. During setup npm resolved a Prisma 8 release candidate with a mismatched 7.x client, so the project uses **TypeORM**, the first-party NestJS integration. The schema itself did not change because of this; it is written as a plain-SQL migration so it is easy to review.
 
-> **Implementation notes (final build vs. this plan)**
-> - **TypeORM** replaced Prisma: npm resolved a Prisma 8 release candidate with a mismatched 7.x client. The schema is a plain-SQL migration in `backend/src/database/migrations`.
-> - The schema has **4 tables**: `documents` (uploaded file + retry state) and `extraction_attempts` (history of every run) were added in front of `reports` / `report_parameters`, so a failed PDF can be retried without re-uploading. Endpoints are under `/api/documents`.
-> - `report_parameters.name_normalized` was added for test-name normalisation.
-> - OCR uses the `eng` model from the `@tesseract.js-data/eng` package (no separate `tessdata/` folder, no `sharp`); image clean-up is done on the canvas.
-> - Tests use **Vitest** (NestJS 12 is ESM-only). The gap-detection strategy and rate limiting are listed as future improvements.
 ---
 
 ## 1. Purpose
@@ -26,7 +22,8 @@ This system lets a user:
 1. Upload a lab report PDF (digital or scanned).
 2. Automatically extract the report details and every test parameter (name, value, unit, reference range).
 3. Store the data in PostgreSQL against a **Report ID / Sample ID**.
-4. View the stored data in a table that looks like the original PDF.
+4. View the stored data in a table next to the original PDF.
+5. Retry a failed extraction without uploading the file again.
 
 ---
 
@@ -37,7 +34,7 @@ This system lets a user:
 - Text extraction from digital PDFs and OCR for scanned pages.
 - Table detection that works across different layouts and multiple pages.
 - Storage of a variable number of parameters per report.
-- Listing, viewing and deleting reports.
+- Listing, viewing, retrying and deleting documents.
 - Handling of all edge cases listed in the assignment (section 9).
 
 ### Out of scope
@@ -53,29 +50,31 @@ This system lets a user:
 ```mermaid
 flowchart LR
     U[User / Browser] -->|HTTP| FE[Next.js Frontend]
-    FE -->|REST API - JSON / multipart| BE[NestJS Backend]
+    FE -->|REST API - JSON / multipart| BE
 
     subgraph BE[NestJS Backend]
-        C[Reports Controller] --> V[Upload Validator]
-        V --> S[Reports Service]
-        S --> EX[Extraction Engine]
-        EX --> TX[Text Extractor<br/>pdfjs-dist]
-        EX --> OCR[OCR Extractor<br/>tesseract.js]
-        EX --> P[Table Parser]
-        S --> R[Prisma Repository]
+        C[DocumentsController] --> V[PdfFilePipe<br/>upload validation]
+        V --> S[DocumentsService]
+        S --> FS[FileStorageService<br/>local disk]
+        S --> EX[ExtractionService]
+        EX --> TX[pdf-reader<br/>pdfjs-dist]
+        EX --> OCR[TesseractOcrProvider<br/>tesseract.js]
+        EX --> P[table-parser<br/>metadata-parser]
+        S --> R[TypeORM Repositories<br/>+ DataSource transactions]
     end
 
     R --> DB[(PostgreSQL)]
-    OCR -.loads.-> M[[eng.traineddata<br/>LSTM model - bundled]]
+    FS --> DISK[[backend/storage<br/>original PDFs]]
+    OCR -.loads.-> M[[eng.traineddata<br/>LSTM model from npm package]]
 ```
 
 The system has three tiers:
 
 | Tier | Responsibility |
 |---|---|
-| **Presentation** – Next.js | Upload screen, report list, report detail table, error/warning messages |
-| **Application** – NestJS | Validation, duplicate check, PDF reading, OCR, table parsing, persistence, REST API |
-| **Data** – PostgreSQL | Durable storage of reports and their parameters |
+| **Presentation** – Next.js | Upload screen, documents list, report page (PDF + table), error/warning messages, retry/delete |
+| **Application** – NestJS | Validation, duplicate check, file storage, PDF reading, OCR, table parsing, persistence, retry, REST API |
+| **Data** – PostgreSQL | Durable storage of documents, attempts, reports and their parameters |
 
 ---
 
@@ -85,31 +84,31 @@ The system has three tiers:
 
 | Page | Route | Purpose |
 |---|---|---|
-| Upload | `/` | Drag-and-drop / file picker, progress indicator, clear error messages |
-| Reports list | `/reports` | All reports: Report ID, patient, date, parameter count, extraction method, status |
-| Report detail | `/reports/[id]` | **Side-by-side view**: original PDF (left) and extracted table (right) in PDF order, with section headings, H/L highlights, warnings, "view raw text" and a "reprocess" button for failed reports |
+| Home | `/` | Upload card (drag-and-drop / file picker, progress, clear errors) and the list of uploaded documents with status, retry and delete |
+| Report | `/documents/[id]` | **Side-by-side view**: original PDF (left) and extracted table (right) in PDF order, with section headings, H/L highlights, warnings, processing history, raw text, Retry and Delete |
 
 ### 4.2 Backend (NestJS) modules
 
 | Module / Class | Responsibility |
 |---|---|
-| `ReportsController` | REST endpoints, maps errors to HTTP status codes |
-| `UploadValidator` | Size limit, extension, MIME type, `%PDF-` magic bytes |
-| `ReportsService` | Orchestrates the flow: hash → duplicate check → extract → parse → save |
-| `TextExtractor` | Uses `pdfjs-dist` to get every word with its x/y position per page |
-| `OcrExtractor` | Renders a page to an image (~300 DPI), pre-processes it, runs Tesseract, returns words with positions + confidence |
-| `TableParser` | Rebuilds rows, finds header/columns, parses values and ranges, merges pages, scores the result |
-| `MetadataParser` | Finds Report/Sample ID, patient name, report date, lab name |
-| `PrismaService` | Database access, transactions |
+| `DocumentsController` | REST endpoints under `/api/documents` |
+| `PdfFilePipe` | File present, `.pdf` extension, MIME type, `%PDF-` magic bytes |
+| `DocumentsService` | Upload flow (hash → duplicate check → store file → extract → save), retry, list, detail, delete, recovery of interrupted documents on startup |
+| `FileStorageService` | Saves the original PDF as `storage/<sha256>.pdf`, streams and deletes it |
+| `ExtractionService` | Per-page text vs OCR decision, OCR retry, quality checks, builds the extraction result |
+| `pdf-reader` | Opens the PDF, returns every word with its x/y position, renders pages for OCR |
+| `TesseractOcrProvider` | Runs Tesseract (one reusable worker) behind the `OcrProvider` interface |
+| `table-parser` | Header and line-pattern strategies, row clean-up, scoring |
+| `metadata-parser` | Report/Sample ID, patient name, report date, lab name |
+| `DatabaseModule` | TypeORM connection, entities, migration run at startup |
 
-### 4.3 Request pipeline (middleware, guards, interceptors, pipes, filters)
+### 4.3 Request pipeline (middleware, interceptors, pipes, filters)
 
 ```mermaid
 flowchart LR
-    REQ[Request] --> MW[Middleware<br/>logger + request ID<br/>helmet, CORS]
-    MW --> GD[Guard<br/>ThrottlerGuard<br/>rate limit]
-    GD --> IC[Interceptor<br/>FileInterceptor<br/>Multer, 10 MB, memory]
-    IC --> PP[Pipes<br/>PdfFileValidationPipe<br/>ParseUUIDPipe<br/>ValidationPipe + DTOs]
+    REQ[Request] --> MW[Middleware<br/>RequestLogger + request ID<br/>helmet, CORS]
+    MW --> IC[Interceptor<br/>FileInterceptor<br/>Multer, 10 MB, memory]
+    IC --> PP[Pipes<br/>PdfFilePipe<br/>ParseUUIDPipe<br/>ParseIntPipe]
     PP --> CT[Controller → Service → DB]
     CT --> RES[Response]
     CT -.error.-> EF[AllExceptionsFilter<br/>uniform JSON error]
@@ -118,15 +117,16 @@ flowchart LR
 
 | Building block | Implementation | Purpose |
 |---|---|---|
-| Middleware | `RequestLoggerMiddleware` | Logs method, URL, status, duration and a request ID |
-| Middleware | `helmet`, CORS | Security headers; only the frontend origin may call the API |
-| Guard | `ThrottlerGuard` | Rate-limits uploads (OCR is CPU-heavy), e.g. 10 per minute per IP |
-| Interceptor | `FileInterceptor` (Multer) | Receives the file in memory with a 10 MB limit |
-| Pipe | `PdfFileValidationPipe` | File present, `.pdf` extension, MIME type, `%PDF-` magic bytes → 400 |
-| Pipe | `ParseUUIDPipe`, global `ValidationPipe` | Validates `:id` and query DTOs (`page`, `limit`) → 400 |
-| Exception filter | `AllExceptionsFilter` | One error format; maps Prisma `P2002` → 409, `P2025` → 404, Multer size → 413; hides internals on 500 |
+| Middleware | `RequestLoggerMiddleware` | Logs method, URL, status, duration and a request ID (`X-Request-Id`) |
+| Middleware | `helmet`, CORS | Security headers; only the frontend origin may call the API or embed the PDF |
+| Interceptor | `FileInterceptor` (Multer) | Receives the file in memory with a 10 MB limit (413 when larger) |
+| Pipe | `PdfFilePipe` | Rejects non-PDF input → 400 |
+| Pipe | `ParseUUIDPipe`, `ParseIntPipe` + `DefaultValuePipe` | Validates `:id` and `page` / `limit` → 400 |
+| Exception filter | `AllExceptionsFilter` | One error shape `{ statusCode, code, message, ...details, path, timestamp }`; hides internals on 500 |
 
-Not used on purpose: an auth guard (no login required), Next.js middleware (nothing to protect) and a caching interceptor (not needed at this scale).
+Unique-constraint violations from PostgreSQL (`23505`) are caught in the service and mapped to **409** (`DUPLICATE_FILE`, `DUPLICATE_REPORT_ID`).
+
+Not used on purpose: an auth guard (no login required), rate limiting (future improvement), Next.js middleware (nothing to protect) and a caching interceptor (not needed at this scale).
 
 ---
 
@@ -137,30 +137,37 @@ sequenceDiagram
     actor User
     participant FE as Next.js
     participant API as NestJS API
-    participant EX as Extraction Engine
+    participant EX as ExtractionService
     participant DB as PostgreSQL
 
     User->>FE: Select PDF
-    FE->>API: POST /api/reports/upload (multipart)
+    FE->>API: POST /api/documents/upload (multipart)
     API->>API: Validate size / type / %PDF- bytes
     alt invalid file
-        API-->>FE: 400 Bad Request
+        API-->>FE: 400 / 413
     end
     API->>API: SHA-256 hash of file
-    API->>DB: Find report by file_hash
+    API->>DB: Find document by file_hash
     alt already uploaded
-        API-->>FE: 409 Conflict + existing report id
+        API-->>FE: 409 DUPLICATE_FILE + documentId
     end
+    API->>API: Save file to storage/<hash>.pdf
+    API->>DB: INSERT document (processing) + attempt 1 (running)
     API->>EX: extract(pdfBuffer)
-    EX->>EX: For each page: text layer? else OCR
-    EX->>EX: Parse metadata + table (multi-strategy)
-    alt corrupted / no table found
-        API-->>FE: 422 Unprocessable Entity
+    alt extraction fails (corrupted, no table, poor scan)
+        API->>DB: attempt = failed (stage, error); document = failed (retryable?)
+        API-->>FE: 422 + documentId + retryable
     end
-    API->>DB: BEGIN; insert report + parameters; COMMIT
-    API-->>FE: 201 Created + report JSON
-    FE->>User: Show extracted table + warnings
+    API->>DB: BEGIN; insert report + parameters; attempt = success; document = completed / needs_review; COMMIT
+    alt same lab + Report ID already exists
+        API->>DB: remove the new document and file
+        API-->>FE: 409 DUPLICATE_REPORT_ID
+    end
+    API-->>FE: 201 document + report + parameters
+    FE->>User: Report page: PDF + extracted table + warnings
 ```
+
+**Retry** (`POST /api/documents/:id/retry`) reads the stored file and runs the same flow as a new attempt. The document is claimed with one atomic `UPDATE ... WHERE status <> 'processing'`, so two clicks cannot run twice; a retry replaces the previous report inside the same transaction.
 
 ---
 
@@ -171,88 +178,95 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     A[PDF buffer] --> B[Open with pdfjs-dist]
-    B -->|error / password| X1[422 Corrupted or protected]
-    B --> C{For each page:<br/>text length > 20 chars?}
+    B -->|damaged / password| X1[422 CORRUPTED_PDF / PASSWORD_PROTECTED<br/>not retryable]
+    B --> C{For each page:<br/>text layer >= 20 chars?}
     C -->|Yes| D[Text layer words + x/y]
     C -->|No - scanned| E[Render page to image 300 DPI]
-    E --> F[Greyscale + contrast]
-    F --> G[Tesseract LSTM OCR<br/>words + x/y + confidence]
-    D --> H[Group words into lines by y]
-    G --> H
-    H --> I[Metadata parser<br/>Report ID, patient, date]
-    H --> J[Table parser - multi-strategy]
-    J --> K[Score each strategy result]
-    K --> L{Best score OK?}
-    L -->|Yes| M[status = completed]
-    L -->|Low| N[status = needs_review + warning]
-    L -->|No rows + digital PDF| X2[422 No parameters detected]
-    L -->|No rows + scanned, 1st try| R[OCR retry: 400 DPI + binarise + PSM 4]
+    E --> G[Tesseract LSTM OCR, PSM 6<br/>words + x/y + confidence]
+    G --> Q{Confidence < 75%<br/>or no rows?}
+    Q -->|Yes| R[Retry: black and white + speck removal, PSM 4<br/>keep the better result]
+    Q -->|No| H
     R --> H
-    L -->|No rows + scanned, after retry| X3[status = extraction_failed + reason]
+    D --> H[Group words into lines by y]
+    H --> J[Table parser: header strategy + line-pattern strategy]
+    J --> K{Result}
+    K -->|OCR confidence < 70%| X3[422 OCR_LOW_CONFIDENCE<br/>retryable]
+    K -->|No rows| X2[422 NO_PARAMETERS_FOUND / OCR_NO_TABLE]
+    K -->|Rows found| I[Metadata parser: lines above the table]
+    I --> L{Score >= 0.7 and<br/>OCR >= 85%?}
+    L -->|Yes| M[status = completed]
+    L -->|No| N[status = needs_review + warning]
 ```
-
-### 6.2a OCR retry and graceful failure
-A scanned page that gives low OCR confidence (< 60%) or no table rows is **retried once** with stronger image cleanup (400 DPI, greyscale, binarisation, Tesseract PSM 4). The better of the two attempts is kept.
-
-If the retry also fails, the report is **still saved** with `status = extraction_failed` and a reason (e.g. *"Low image quality – OCR confidence 32%"*), together with the raw OCR text. Wrong values are never stored as if they were correct; the duplicate check still works; and the report can be re-processed later without re-uploading.
-
-OCR is behind an `OcrProvider` interface (`recognize(image) → words + x/y + confidence`). Only `TesseractOcrProvider` is implemented; a cloud OCR provider can be added later by configuration without changing the rest of the system.
 
 ### 6.2 Digital vs scanned detection
 Detection is **per page**, so a PDF with mixed pages works. The report is marked `extraction_method = text | ocr | mixed`.
 
-### 6.3 Table parsing strategies (tried in order, best score wins)
+### 6.3 OCR retry and safe failure
+A scanned PDF whose OCR confidence is below **75%** (or that gives no rows) is **retried once** with stronger image clean-up (black and white + 3x3 median filter to remove specks, Tesseract PSM 4). The better attempt is kept.
+
+If the average confidence is still below **70%**, extraction **fails on purpose** (`OCR_LOW_CONFIDENCE`) instead of storing guessed lab values. The document, the stored file and the attempt history remain, so the user can retry (up to 3 attempts in total).
+
+OCR is behind an `OcrProvider` interface (`recognize(image) → lines of words + x/y + confidence`). Only `TesseractOcrProvider` is implemented; a cloud OCR provider can be added later without changing the rest of the system.
+
+### 6.4 Table parsing strategies
 
 | # | Strategy | When it helps |
 |---|---|---|
-| 1 | **Header synonyms** – find the header line using a dictionary (`Test/Investigation/Parameter`, `Result/Observed Value`, `Unit/UOM`, `Reference/Normal Range/Biological Ref. Interval`); use header x-positions as column boundaries | Most reports; column order does not matter |
-| 2 | **Line regex** – `<name> <value> [H/L] <unit>? <range>?` per line | No header found, or noisy OCR output where positions are unreliable |
+| 1 | **Header synonyms** – find the header line using a dictionary (`Test/Investigation/Parameter`, `Result/Observed Value`, `Unit/Units/UOM`, `Reference Range/Biological Ref. Interval`, plus `Method`, `Flag`); use header x-positions as column boundaries | Most reports; column order does not matter, extra columns are kept |
+| 2 | **Line pattern** – `<name> <value> [H/L] [unit] [range]` per line | No header found, or OCR output where positions are unreliable |
 
-**Parse score** = rows that have both a name and a value ÷ all candidate rows. The strategy with the higher score wins.
+**Parse score** = rows with a name and at least a value, unit or range ÷ all data rows. The header strategy wins unless the line pattern scores more than 0.1 higher.
 
-### 6.4 Row post-processing rules
+### 6.5 Row clean-up rules
 
 | Situation | Rule |
 |---|---|
-| Section heading (`HAEMATOLOGY`) | Row with name only, usually upper-case → stored as `is_section = true` |
-| Name wrapped to 2 lines | Name-only line directly under a full row is appended to that row's name |
-| Value + unit joined (`13.5g/dL`) | Split by regex |
-| Flag next to value (`128 H`, `128*`, `↑`) | Moved into `flag` |
-| Repeated header on next page | Skipped |
+| Section heading (`HAEMATOLOGY`) | Name-only row in capitals (no digits) → `is_section = true`; following rows get `section_name` |
+| Name wrapped to 2 lines | Name-only line directly under a data row is appended to that row's name |
+| Value + unit joined (`13.5g/dL`) | Split into value and unit |
+| Flag next to value (`128 H`, `245*`, `↑`) | Moved into `flag` |
+| No printed flag | H/L calculated from the range (digital PDFs only) |
+| Repeated header / "continued" line on the next page | Skipped |
 | Footer (`End of Report`, `Pathologist`, `Interpretation`) | Table ends |
-| OCR character mix-ups in value column (`O`→`0`, `l`→`1`) | Corrected |
+| OCR mix-ups in numeric cells (`O`→`0`, `l`→`1`) | Corrected |
+| OCR rows without a real value | Dropped (noise) |
 
-### 6.5 Value and range parsing
+### 6.6 Value and range parsing
 
 | Raw value | value_numeric | comparator | flag |
 |---|---|---|---|
 | `13.5` | 13.5 | – | – |
+| `1,85,000` | 185000 | – | – |
 | `128 H` | 128 | – | H |
 | `<5` | 5 | `<` | – |
-| `Positive` / `Nil` | NULL | – | – |
+| `Positive` / `Nil` / `2-4` | NULL | – | – |
 
 | Raw range | ref_low | ref_high |
 |---|---|---|
-| `13.0 - 17.0` / `13–17` | 13 | 17 |
+| `13.0 - 17.0` / `13–17` / `4 to 11` | 13 | 17 |
 | `< 200` / `Up to 200` | NULL | 200 |
 | `> 40` | 40 | NULL |
+| `17 - 13` (reversed) | NULL | NULL + warning |
 | `Negative`, `M: 13-17 F: 12-15` | NULL | NULL (kept as text) |
 
-### 6.6 Report ID detection
-Regex on the text above the table for labels: `Report ID`, `Sample ID`, `Lab No`, `Accession No`, `Reg. No`, `Barcode`.
-If not found → generate `AUTO-<yyyymmdd>-<first 6 chars of file hash>` and set `id_auto_generated = true`.
+### 6.7 Report details
+Regex on the lines above the table for labels: `Report ID`, `Sample ID`, `Lab No`, `Accession No`, `Reg. No`, `Barcode`; patient name; report date (day-first, invalid or future dates ignored); lab name from the top lines.
+If no ID is found → `AUTO-<yyyymmdd>-<first 6 chars of file hash>` with `id_auto_generated = true` and a warning.
 
 ---
 
 ## 7. Database Design
 
 ### 7.1 Concept
-A report has a **variable number** of parameters, so parameters are **rows, not columns**. A parent–child (one-to-many) design is used:
+- A report has a **variable number** of parameters, so parameters are **rows, not columns** (`report_parameters`, one row per test line).
+- The uploaded **file** is separate from the extracted **report**, so a failure at any stage still leaves the file and its history, and the whole flow can be retried.
 
-- `reports` – one row per uploaded PDF.
-- `report_parameters` – one row per test line in that PDF.
-
-A report with 8 parameters has 8 child rows; one with 25 has 25 rows. **No schema change is ever needed.**
+| Table | One row per |
+|---|---|
+| `documents` | Uploaded PDF (stored path, SHA-256 hash, status, attempts, last error, retryable) |
+| `extraction_attempts` | Extraction run (first upload and each retry): status, failed stage, error, method, rows, timing |
+| `reports` | Successfully extracted report header (one per document) |
+| `report_parameters` | Test line in a report |
 
 ### 7.2 Why not the alternatives
 
@@ -268,27 +282,56 @@ JSONB is still used for **small, truly unstructured** data: `warnings` and `extr
 
 ```mermaid
 erDiagram
-    REPORTS ||--o{ REPORT_PARAMETERS : contains
+    DOCUMENTS ||--o{ EXTRACTION_ATTEMPTS : "has"
+    DOCUMENTS ||--o| REPORTS : "produces"
+    REPORTS ||--o{ REPORT_PARAMETERS : "contains"
+
+    DOCUMENTS {
+        uuid id PK
+        varchar file_name
+        varchar file_path "storage/<hash>.pdf"
+        char file_hash UK "SHA-256"
+        int file_size_bytes
+        enum status "processing | completed | needs_review | failed"
+        int attempt_count
+        varchar last_error_code "nullable"
+        text last_error_message "nullable"
+        boolean is_retryable
+        timestamptz created_at
+        timestamptz updated_at
+    }
+
+    EXTRACTION_ATTEMPTS {
+        uuid id PK
+        uuid document_fk FK "ON DELETE CASCADE"
+        int attempt_no "UNIQUE with document_fk"
+        enum status "running | success | failed"
+        enum failed_stage "load | text_extract | ocr | parse | save"
+        varchar error_code "nullable"
+        text error_message "nullable"
+        enum extraction_method "text | ocr | mixed"
+        int rows_found
+        numeric parse_score
+        int duration_ms
+        timestamptz started_at
+        timestamptz finished_at
+    }
 
     REPORTS {
         uuid id PK
-        varchar report_id UK "from PDF or AUTO-..."
+        uuid document_fk FK "UNIQUE, ON DELETE CASCADE"
+        varchar report_id "from PDF or AUTO-..."
         boolean id_auto_generated
         varchar patient_name "nullable"
         date report_date "nullable"
-        varchar lab_name "default UNKNOWN"
-        varchar file_name
-        varchar file_path "stored original PDF"
-        char file_hash UK "SHA-256"
-        int file_size_bytes
+        varchar lab_name "NOT NULL default UNKNOWN"
         int page_count
-        varchar extraction_method "text | ocr | mixed"
-        varchar status "completed | needs_review | extraction_failed"
-        varchar failure_reason "nullable"
+        enum extraction_method "text | ocr | mixed"
         numeric parse_score
         jsonb warnings
         text raw_text
         timestamptz created_at
+        timestamptz updated_at
     }
 
     REPORT_PARAMETERS {
@@ -298,7 +341,8 @@ erDiagram
         int page_number
         boolean is_section
         varchar section_name "nullable"
-        varchar name
+        varchar name "as printed"
+        varchar name_normalized "e.g. Hb -> Hemoglobin"
         varchar value_raw "nullable - exact text"
         numeric value_numeric "nullable"
         varchar comparator "nullable - < > <= >="
@@ -316,14 +360,20 @@ erDiagram
 
 | Object | Purpose |
 |---|---|
-| `reports.file_hash` UNIQUE | Detects the same PDF uploaded twice |
+| `documents.file_hash` UNIQUE | Detects the same PDF uploaded twice (also under concurrent uploads) |
 | `reports (lab_name, report_id)` UNIQUE | One report per Report/Sample ID per lab (two labs may reuse the same ID) |
+| `reports.document_fk` UNIQUE | One report per document; a retry replaces it |
+| `extraction_attempts (document_fk, attempt_no)` UNIQUE | Attempt numbers never repeat |
+| `documents (status, updated_at)` index | Finds documents stuck in `processing` after a restart |
 | `report_parameters (report_fk, row_order)` index | Fast fetch in PDF order |
-| `report_parameters (name)` index | Search across reports by test name |
-| FK `ON DELETE CASCADE` | Deleting a report removes its parameters |
+| `report_parameters (name_normalized)` index | Search across reports by test name |
+| FKs `ON DELETE CASCADE` | Deleting a document removes its attempts, report and parameters |
 
-### 7.5 Key design decision
-`value_raw` always keeps the **exact text** from the PDF, and `value_numeric` holds a number **only when one exists**. Nothing is lost (`Positive`, `<5`, `Nil`), and numeric queries still work.
+### 7.5 Key design decisions
+- `value_raw` always keeps the **exact text** from the PDF, and `value_numeric` holds a number **only when one exists**. Nothing is lost (`Positive`, `<5`, `Nil`), and numeric queries still work.
+- `lab_name` is **NOT NULL** (default `UNKNOWN`): PostgreSQL treats NULLs as distinct, which would bypass `UNIQUE(lab_name, report_id)`.
+- Values and ranges use exact `numeric`, not floating point.
+- Duplicates are enforced by **unique constraints**, not "check then insert", so two simultaneous requests cannot both succeed.
 
 ---
 
@@ -333,23 +383,26 @@ Base path: `/api`
 
 | Method | Endpoint | Description | Success | Errors |
 |---|---|---|---|---|
-| POST | `/reports/upload` | Upload + extract + save (multipart field `file`) | 201 report | 400, 409, 413, 422, 500 |
-| GET | `/reports` | List reports (paginated: `?page=&limit=`) | 200 | – |
-| GET | `/reports/:id` | Report + parameters ordered by `row_order` | 200 | 404 |
-| GET | `/reports/:id/raw-text` | Original extracted text | 200 | 404 |
-| GET | `/reports/:id/file` | Stream the original PDF (for side-by-side view) | 200 | 404 |
-| POST | `/reports/:id/reprocess` | Re-run extraction on the stored PDF (e.g. after `extraction_failed`) | 200 | 404, 422 |
-| DELETE | `/reports/:id` | Delete report and its parameters | 204 | 404 |
-| GET | `/health` | API + DB health check | 200 | 503 |
+| POST | `/documents/upload` | Upload + extract + save (multipart field `file`) | 201 document + report | 400, 409, 413, 422 |
+| GET | `/documents` | List documents with report summary (`?page=&limit=`) | 200 | 400 |
+| GET | `/documents/:id` | Document, report, parameters (PDF order), attempt history, raw text | 200 | 400, 404 |
+| GET | `/documents/:id/file` | Stream the original PDF (for the side-by-side view) | 200 | 400, 404 |
+| POST | `/documents/:id/retry` | Run the whole extraction again on the stored file | 200 | 404, 409, 422 |
+| DELETE | `/documents/:id` | Delete document, attempts, report, parameters and file | 204 | 400, 404 |
+| GET | `/health` | API + database status | 200 | 503 |
 
 Standard error body:
 
 ```json
 {
   "statusCode": 409,
-  "error": "DUPLICATE_REPORT",
-  "message": "This PDF has already been uploaded.",
-  "existingReportId": "c1f2…"
+  "code": "DUPLICATE_FILE",
+  "message": "This PDF was already uploaded as \"01-basic-8-params.pdf\".",
+  "documentId": "c1f2…",
+  "documentStatus": "completed",
+  "retryable": false,
+  "path": "/api/documents/upload",
+  "timestamp": "2026-11-22T09:36:42.200Z"
 }
 ```
 
@@ -359,20 +412,22 @@ Standard error body:
 
 | Edge case | Handling | HTTP |
 |---|---|---|
-| Scanned (image) PDF | Per-page detection → OCR with Tesseract LSTM | 201 |
+| Scanned (image) PDF | Per-page detection → Tesseract OCR, one retry with clean-up | 201 |
+| Very poor scan | Confidence < 70% after retry → fail, file kept, retry allowed (max 3 attempts) | 422 `OCR_LOW_CONFIDENCE` |
 | Missing value / unit / range | Nullable columns; UI shows "—" | 201 |
-| Non-numeric values (`<5`, `Positive`, `Nil`) | `value_raw` text + optional `value_numeric` / `comparator` | 201 |
-| Same PDF uploaded twice | SHA-256 `file_hash` UNIQUE → return existing report id | 409 |
-| Different file, same Report ID | `report_id` UNIQUE → reject with message (see Assumptions) | 409 |
-| Report ID missing | Auto-generate `AUTO-…`, `id_auto_generated = true`, UI warning | 201 |
+| Non-numeric values (`<5`, `Positive`, `Nil`) | `value_raw` text + `value_numeric` / `comparator` only when possible | 201 |
+| Same PDF uploaded twice | SHA-256 `file_hash` UNIQUE → link to the existing document | 409 `DUPLICATE_FILE` |
+| Different file, same lab + Report ID | `UNIQUE(lab_name, report_id)`; the new document and file are removed | 409 `DUPLICATE_REPORT_ID` |
+| Report ID missing | `AUTO-…` generated, `id_auto_generated = true`, UI warning | 201 |
 | Table spans multiple pages | All pages parsed, repeated headers skipped, `page_number` kept | 201 |
-| Non-PDF file | Extension + MIME + `%PDF-` magic bytes check | 400 |
-| Corrupted / password-protected PDF | Parser error caught | 422 |
-| File too large (> 10 MB) | Multer size limit | 413 |
-| No table found | Nothing saved | 422 |
-| Low-confidence parse | Saved as `needs_review` with warning | 201 |
-| Poor-quality scan (OCR cannot read it) | One OCR retry with stronger cleanup; if still unreadable, saved as `extraction_failed` with reason + raw OCR text | 201 |
-| Failure in the middle of saving | Single DB transaction → full rollback | 500 |
+| Non-PDF file | Extension + MIME + `%PDF-` magic bytes (also checked in the browser) | 400 `INVALID_FILE_TYPE` |
+| Corrupted / password-protected PDF | pdf.js error → failed, not retryable | 422 |
+| File too large (> 10 MB) | Browser check + Multer size limit | 413 |
+| No table found (digital PDF) | Attempt recorded, document failed | 422 `NO_PARAMETERS_FOUND` |
+| Low parse quality / medium OCR confidence | Saved as `needs_review` with warning | 201 |
+| Two retries at the same time | Atomic claim → second request rejected | 409 `ALREADY_PROCESSING` |
+| Server stopped mid-processing | On startup, documents stuck > 10 min become failed / `INTERRUPTED`, retryable | – |
+| Failure while saving | Single transaction → full rollback, attempt failed at stage `save` | 422 `SAVE_FAILED` |
 
 ---
 
@@ -380,14 +435,14 @@ Standard error body:
 
 | Area | Approach |
 |---|---|
-| **Performance** | Digital PDF: < 1 s. OCR: ~2–5 s per page. Tesseract worker created once and reused. |
-| **Reliability** | DB transaction per upload; no partial data. |
-| **Security** | File-type checks, size limit, files processed in memory (not executed), Prisma parameterised queries, CORS limited to the frontend URL, secrets only in `.env`. |
-| **Privacy** | Sample PDFs contain fake data only. Original PDFs are stored on the server's local disk (`backend/storage/`, git-ignored) and are only served through the API. |
-| **Long OCR requests** | A multi-page scan with a retry can take 20–30 s. The server timeout is raised for the upload route, and the UI shows a clear "Reading scanned PDF…" message. |
-| **Offline / portability** | OCR language model bundled in the repo – no internet download at runtime. |
-| **Maintainability** | Parser split into small pure functions with unit tests; header synonyms kept in one config file. |
-| **Observability** | NestJS Logger: upload, extraction method, page count, parse score, duration, errors. |
+| **Performance** | Digital PDF: < 1 s. OCR: ~5 s per page (more with the retry). One Tesseract worker created on first use and reused. |
+| **Reliability** | Report + parameters written in one transaction; attempts recorded for every run; interrupted runs recovered on startup. |
+| **Security** | File-type checks, size limit, files processed in memory (never executed), TypeORM parameterised queries, stored paths cannot leave the storage folder, CORS limited to the frontend URL, helmet headers, secrets only in `.env`, internal columns (path, hash) never returned. |
+| **Privacy** | Sample PDFs contain fictional data only. Original PDFs are stored on the server's local disk (`backend/storage/`, git-ignored) and only served through the API. |
+| **Long OCR requests** | The UI shows "Reading … Scanned PDFs can take up to 30 seconds". |
+| **Offline / portability** | The OCR model comes from the `@tesseract.js-data/eng` npm package – no download at runtime, nothing to install besides Node.js and PostgreSQL. |
+| **Maintainability** | Parser split into small pure functions; synonyms and units in one dictionary file; 63 automated tests (sample PDFs + business rules). |
+| **Observability** | Request log with request ID; extraction log with method, rows and duration; full attempt history in the database. |
 
 ---
 
@@ -396,20 +451,19 @@ Standard error body:
 ```
 pdf-report-extractor/
 ├── backend/                  NestJS API
-│   ├── prisma/               schema.prisma + migrations
 │   ├── src/
-│   │   ├── reports/          controller, service, DTOs
-│   │   ├── extraction/       text-extractor, ocr-extractor, table-parser, metadata-parser
-│   │   ├── common/           filters, validators, utils
-│   │   └── prisma/           PrismaService
-│   ├── tessdata/             eng.traineddata (bundled OCR model)
-│   └── test/                 parser unit tests + e2e tests
+│   │   ├── database/         TypeORM entities, enums, SQL migration, DatabaseModule
+│   │   ├── documents/        controller, service, mapper, file storage, PDF validation pipe
+│   │   ├── extraction/       pdf/ (pdf.js), ocr/ (Tesseract), parsing/ (lines, table, values, metadata)
+│   │   └── common/           exception filter, request logger
+│   ├── storage/              uploaded PDFs (git-ignored)
+│   └── .env.example
 ├── frontend/                 Next.js app
-│   └── app/                  /, /reports, /reports/[id]
+│   ├── app/                  / and /documents/[id]
+│   ├── components/           UploadCard, DocumentsTable, DocumentView, ParametersTable, StatusBadge
+│   └── lib/api.ts            typed API client
 ├── samples/                  test PDFs + generate-samples.js
-├── docs/                     HLD.md
-├── docker-compose.yml        PostgreSQL (optional)
-├── .env.example
+├── docs/                     HLD.md, LLD.md, Test_Cases.xlsx
 └── README.md
 ```
 
@@ -417,24 +471,24 @@ pdf-report-extractor/
 
 ## 12. Assumptions
 
-1. No real lab reports were provided; realistic sample PDFs (fake data) are generated by a script, including scanned versions.
+1. No real lab reports were provided; realistic sample PDFs (fictional data) are generated by a script, including scanned versions.
 2. Processing is **synchronous** – the user waits a few seconds. A job queue is not needed at this scale.
 3. Max upload size is **10 MB**; one PDF per upload.
 4. One PDF = one report. If two different files share the same Report ID **from the same lab**, the second is rejected (409).
-5. Reports are in English; OCR uses the English model.
-6. Original PDFs are kept on local disk so they can be viewed next to the extracted data and reprocessed. In production this would be object storage (e.g. S3).
-7. No authentication (not required by the assignment).
+5. Reports are in English; dates are day-first; OCR uses the English model.
+6. Original PDFs are kept on local disk so they can be viewed next to the extracted data and retried. In production this would be object storage (e.g. S3).
+7. At most 3 extraction attempts per document.
+8. No authentication (not required by the assignment).
 
 ---
 
 ## 13. Future Improvements
 
-- **Stronger OCR retry chain**: deskew, auto-rotation (Tesseract OSD), table-line removal.
-- **Gap-detection parsing strategy** for reports that have no header row (find columns from vertical white-space and classify them by content).
-- **Background processing** (BullMQ + Redis) for large or many PDFs, with live status updates.
+- **Stronger OCR**: deskew, auto-rotation (Tesseract OSD), table-line removal, or a cloud OCR provider behind `OcrProvider`.
+- **Gap-detection parsing strategy** for reports that have no header row.
+- **Background processing** (BullMQ + Redis) with automatic retries and live status updates.
+- **Rate limiting** on uploads (`@nestjs/throttler`) and authentication.
 - **Layout profiles** per lab (config files) for known formats.
-- **AI / cloud fallback** (e.g. AWS Textract, Azure Document Intelligence or an LLM) for layouts the rule-based parser cannot read.
-- **Manual correction UI** for `needs_review` reports.
+- **Manual correction UI** for `needs_review` reports; report versioning for corrected reports.
+- **`test_catalog` master table** (LOINC codes, standard units) for full normalisation and trend charts per patient.
 - **Move stored PDFs to object storage** (S3) instead of local disk.
-- **Report versioning** when a corrected report arrives with the same Report ID.
-- **Trend charts** of a parameter across reports for the same patient.

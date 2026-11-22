@@ -1,25 +1,18 @@
 # Low-Level Design (LLD) – PDF Report Data Extractor
 
-This document turns the [HLD](./HLD.md) into concrete files, classes, method signatures, database schema, algorithms and an implementation order.
+This document describes the implemented code: files, classes, methods, database schema, algorithms and tests. The overview is in the [HLD](./HLD.md).
 
 | Item | Choice |
 |---|---|
-| Language | TypeScript everywhere |
-| Backend | NestJS 10 · Prisma · PostgreSQL 16 |
+| Language | TypeScript everywhere (backend is ESM: relative imports end in `.js`) |
+| Backend | NestJS 12 · TypeORM 1.x · PostgreSQL (tested on 19) |
 | PDF text | `pdfjs-dist` (legacy build for Node) |
-| Page → image | `pdfjs-dist` + `@napi-rs/canvas` |
-| Image cleanup | `sharp` |
-| OCR | `tesseract.js` (LSTM, `eng` model bundled in `backend/tessdata/`) |
-| Frontend | Next.js 14 (App Router) · Tailwind CSS |
-| Tests | Jest (unit + e2e with Supertest) |
+| Page → image | `pdfjs-dist` + `@napi-rs/canvas` (image clean-up done on the canvas) |
+| OCR | `tesseract.js` (LSTM, `eng` model from the `@tesseract.js-data/eng` npm package) |
+| Uploads | Multer (memory storage) via `@nestjs/platform-express` |
+| Frontend | Next.js 16 (App Router, `cacheComponents`) · Tailwind CSS 4 |
+| Tests | Vitest (unit + sample-PDF tests); UI checked with Playwright against installed Chrome |
 
-
-> **Implementation notes (final build vs. this plan)**
-> - **TypeORM** replaced Prisma: npm resolved a Prisma 8 release candidate with a mismatched 7.x client. The schema is a plain-SQL migration in `backend/src/database/migrations`.
-> - The schema has **4 tables**: `documents` (uploaded file + retry state) and `extraction_attempts` (history of every run) were added in front of `reports` / `report_parameters`, so a failed PDF can be retried without re-uploading. Endpoints are under `/api/documents`.
-> - `report_parameters.name_normalized` was added for test-name normalisation.
-> - OCR uses the `eng` model from the `@tesseract.js-data/eng` package (no separate `tessdata/` folder, no `sharp`); image clean-up is done on the canvas.
-> - Tests use **Vitest** (NestJS 12 is ESM-only). The gap-detection strategy and rate limiting are listed as future improvements.
 ---
 
 ## 1. Repository Layout
@@ -27,96 +20,61 @@ This document turns the [HLD](./HLD.md) into concrete files, classes, method sig
 ```
 pdf-report-extractor/
 ├── backend/
-│   ├── prisma/
-│   │   ├── schema.prisma
-│   │   └── migrations/
 │   ├── src/
-│   │   ├── main.ts                         bootstrap: helmet, CORS, global pipe/filter, timeout
-│   │   ├── app.module.ts
-│   │   ├── config/
-│   │   │   └── app.config.ts               typed env config
-│   │   ├── prisma/
-│   │   │   ├── prisma.module.ts
-│   │   │   └── prisma.service.ts
+│   │   ├── main.ts                          bootstrap: /api prefix, CORS, helmet, exception filter
+│   │   ├── app.module.ts                    Config + Database + Documents modules, request logger
+│   │   ├── app.controller.ts                GET /api/health
 │   │   ├── common/
-│   │   │   ├── errors/
-│   │   │   │   ├── error-codes.ts          ErrorCode enum
-│   │   │   │   └── app.exception.ts        AppException (code + status + extra)
-│   │   │   ├── filters/
-│   │   │   │   └── all-exceptions.filter.ts
-│   │   │   ├── middleware/
-│   │   │   │   └── request-logger.middleware.ts
-│   │   │   ├── pipes/
-│   │   │   │   └── pdf-file-validation.pipe.ts
-│   │   │   └── utils/
-│   │   │       └── hash.util.ts            sha256(buffer)
-│   │   ├── storage/
-│   │   │   ├── storage.module.ts
-│   │   │   └── file-storage.service.ts     save / read / delete PDFs on disk
-│   │   ├── extraction/
-│   │   │   ├── extraction.module.ts
-│   │   │   ├── extraction.service.ts       orchestrates the pipeline
-│   │   │   ├── types.ts                    Word, Line, PageContent, ParsedRow, ExtractionResult
-│   │   │   ├── pdf/
-│   │   │   │   ├── pdf-loader.ts           open PDF, detect corrupted / password
-│   │   │   │   ├── text-extractor.ts       words + positions from text layer
-│   │   │   │   └── page-renderer.ts        page → PNG buffer at N DPI
-│   │   │   ├── ocr/
-│   │   │   │   ├── ocr-provider.interface.ts
-│   │   │   │   ├── tesseract-ocr.provider.ts
-│   │   │   │   └── image-preprocessor.ts   sharp: greyscale, normalise, threshold
-│   │   │   └── parsing/
-│   │   │       ├── header-synonyms.ts      synonym dictionary + footer/stop words
-│   │   │       ├── line-builder.ts         words → lines (group by y)
-│   │   │       ├── metadata-parser.ts      report ID, patient, date, lab
-│   │   │       ├── header-table.strategy.ts   strategy 1
-│   │   │       ├── line-regex.strategy.ts     strategy 2
-│   │   │       ├── row-postprocessor.ts    sections, wrapped names, flags, OCR fixes
-│   │   │       ├── value-parser.ts         "<5", "128 H", "Positive"
-│   │   │       ├── range-parser.ts         "13 - 17", "< 200", "Up to 5"
-│   │   │       └── table-parser.ts         runs strategies, scores, picks best
-│   │   ├── reports/
-│   │   │   ├── reports.module.ts
-│   │   │   ├── reports.controller.ts
-│   │   │   ├── reports.service.ts
-│   │   │   ├── reports.repository.ts       all Prisma queries for reports
-│   │   │   └── dto/
-│   │   │       ├── list-reports.query.dto.ts
-│   │   │       └── report.response.ts      response mappers
-│   │   └── health/
-│   │       └── health.controller.ts
-│   ├── storage/                            uploaded PDFs (git-ignored)
-│   ├── tessdata/eng.traineddata            bundled OCR model
-│   ├── test/
-│   │   ├── unit/                           parser tests
-│   │   └── e2e/reports.e2e-spec.ts
-│   ├── .env.example
-│   └── package.json
+│   │   │   ├── app.exception.ts             AppException(code, message, status, extra)
+│   │   │   ├── all-exceptions.filter.ts     one JSON error shape for every error
+│   │   │   └── request-logger.middleware.ts method, URL, status, duration, X-Request-Id
+│   │   ├── database/
+│   │   │   ├── database.module.ts           TypeORM connection (DATABASE_URL), runs migrations at startup
+│   │   │   ├── enums.ts                     DocumentStatus, AttemptStatus, ExtractionStage, ExtractionMethod
+│   │   │   ├── numeric.transformer.ts       NUMERIC (string from pg) -> number
+│   │   │   ├── entities/                    document, extraction-attempt, report, report-parameter
+│   │   │   └── migrations/1763800000000-init-schema.ts   plain SQL CREATE TABLE / TYPE / INDEX
+│   │   ├── documents/
+│   │   │   ├── documents.module.ts
+│   │   │   ├── documents.controller.ts      /api/documents endpoints
+│   │   │   ├── documents.service.ts         upload, retry, list, detail, file, delete, restart recovery
+│   │   │   ├── documents.mapper.ts          entity -> response (hides file path and hash)
+│   │   │   ├── documents.constants.ts       MAX_ATTEMPTS = 3
+│   │   │   ├── file-storage.service.ts      storage/<sha256>.pdf on local disk
+│   │   │   └── pdf-file.pipe.ts             extension + MIME + %PDF- check
+│   │   └── extraction/
+│   │       ├── extraction.module.ts
+│   │       ├── extraction.service.ts        pipeline: text vs OCR, retry, quality checks
+│   │       ├── extraction.service.spec.ts   runs the engine on every sample PDF
+│   │       ├── types.ts                     Word, Line, PageContent, ParsedRow, ExtractionResult, ExtractionError
+│   │       ├── pdf/pdf-reader.ts            loadPdf, extractPageWords, renderPage, cleanScan
+│   │       ├── ocr/ocr-provider.ts          OcrProvider interface + OCR_PROVIDER token
+│   │       ├── ocr/tesseract-ocr.provider.ts
+│   │       └── parsing/
+│   │           ├── dictionaries.ts          column synonyms, stop/skip phrases, units, test-name synonyms
+│   │           ├── line-builder.ts          words -> lines
+│   │           ├── metadata-parser.ts       report ID, patient, date, lab
+│   │           ├── table-parser.ts          header + line-pattern strategies, cleanRows, scoring
+│   │           ├── value-parsers.ts         values, ranges, flags, units, name normalisation
+│   │           └── business-rules.spec.ts   52 unit tests (BL-01 ... BL-52)
+│   ├── storage/                             uploaded PDFs (git-ignored)
+│   ├── vitest.config.ts
+│   └── .env.example
 ├── frontend/
 │   ├── app/
-│   │   ├── layout.tsx
-│   │   ├── page.tsx                        upload page
-│   │   └── reports/
-│   │       ├── page.tsx                    list
-│   │       └── [id]/page.tsx               detail (side-by-side)
+│   │   ├── layout.tsx                       header + page container
+│   │   ├── page.tsx                         "/" upload card + documents list
+│   │   └── documents/[id]/page.tsx          Suspense wrapper for the report view
 │   ├── components/
-│   │   ├── UploadDropzone.tsx
-│   │   ├── ReportsTable.tsx
-│   │   ├── ReportHeader.tsx
-│   │   ├── StatusBanner.tsx
+│   │   ├── UploadCard.tsx
+│   │   ├── DocumentsTable.tsx
+│   │   ├── DocumentView.tsx
 │   │   ├── ParametersTable.tsx
-│   │   ├── PdfViewer.tsx
-│   │   └── RawTextDialog.tsx
-│   ├── lib/
-│   │   ├── api.ts                          typed API client
-│   │   └── types.ts                        shared response types
-│   ├── .env.example
-│   └── package.json
-├── samples/
-│   ├── generate-samples.js
-│   └── *.pdf
-├── docs/  HLD.md · LLD.md
-├── .gitignore
+│   │   └── StatusBadge.tsx                  StatusBadge + MethodBadge
+│   ├── lib/api.ts                           typed API client + response types
+│   └── .env.example
+├── samples/                                 12 sample PDFs + generate-samples.js
+├── docs/                                    HLD.md, LLD.md, Test_Cases.xlsx
 └── README.md
 ```
 
@@ -126,16 +84,12 @@ pdf-report-extractor/
 
 ### backend/.env.example
 ```env
-DATABASE_URL=postgresql://postgres:postgres@localhost:5432/pdf_reports?schema=public
+DATABASE_URL=postgresql://postgres:YOUR_PASSWORD@localhost:5432/pdf_reports
 PORT=4000
 FRONTEND_URL=http://localhost:3000
 MAX_UPLOAD_MB=10
 STORAGE_DIR=./storage
-TESSDATA_DIR=./tessdata
 OCR_DPI=300
-OCR_RETRY_DPI=400
-UPLOAD_TIMEOUT_MS=120000
-THROTTLE_UPLOADS_PER_MIN=10
 ```
 
 ### frontend/.env.example
@@ -143,164 +97,149 @@ THROTTLE_UPLOADS_PER_MIN=10
 NEXT_PUBLIC_API_URL=http://localhost:4000/api
 ```
 
-### Tunable constants (`extraction/parsing/constants.ts`)
-| Constant | Value | Meaning |
-|---|---|---|
-| `TEXT_PAGE_MIN_CHARS` | 20 | Fewer characters on a page → treat page as scanned |
-| `LINE_Y_TOLERANCE` | 3 pt (text) / 0.5 × median word height (OCR) | Words within this y-distance are on the same line |
-| `OCR_MIN_CONFIDENCE` | 60 | Below this average confidence → retry OCR |
-| `REVIEW_SCORE_THRESHOLD` | 0.7 | Parse score below this → `needs_review` |
-| `MIN_ROWS` | 1 | Fewer rows → no table found |
+### Constants in code
+
+| Constant | File | Value | Meaning |
+|---|---|---|---|
+| `TEXT_PAGE_MIN_CHARS` | extraction.service.ts | 20 | Fewer characters in a page's text layer → page is scanned |
+| `PSM_FIRST` / `PSM_RETRY` | extraction.service.ts | 6 / 4 | Tesseract page segmentation: one block / one column |
+| `OCR_RETRY_CONFIDENCE` | extraction.service.ts | 75 | Below this (or no rows) → one OCR retry with clean-up |
+| `OCR_RETRY_DPI` | extraction.service.ts | 300 | Render resolution for the retry |
+| `OCR_MIN_CONFIDENCE` | extraction.service.ts | 70 | Below this after the retry → extraction fails |
+| `MIN_WORD_CONFIDENCE` | tesseract-ocr.provider.ts | 30 | OCR words below this are dropped as noise |
+| Line tolerance | line-builder.ts | max(3 pt, 0.5 × median word height) | Words this close vertically form one line |
+| Column slack | table-parser.ts | 8 pt | A word belongs to the right-most column starting at or before `x + 8` |
+| `REVIEW_SCORE` | documents.service.ts | 0.7 | Parse score below this → `needs_review` |
+| `REVIEW_OCR_CONFIDENCE` | documents.service.ts | 85 | OCR confidence below this → `needs_review` |
+| `STALE_PROCESSING_MINUTES` | documents.service.ts | 10 | `processing` older than this at startup → interrupted |
+| `MAX_ATTEMPTS` | documents.constants.ts | 3 | Extraction attempts per document (upload included) |
 
 ---
 
-## 3. Database Schema (Prisma)
+## 3. Database Schema
 
-```prisma
-generator client {
-  provider = "prisma-client-js"
-}
+TypeORM entities map camelCase fields to snake_case columns. The schema is created by one plain-SQL migration (`InitSchema1763800000000`), run automatically at startup (`migrationsRun: true`, `synchronize: false`).
 
-datasource db {
-  provider = "postgresql"
-  url      = env("DATABASE_URL")
-}
+```sql
+CREATE TYPE document_status   AS ENUM ('processing', 'completed', 'needs_review', 'failed');
+CREATE TYPE attempt_status    AS ENUM ('running', 'success', 'failed');
+CREATE TYPE extraction_stage  AS ENUM ('load', 'text_extract', 'ocr', 'parse', 'save');
+CREATE TYPE extraction_method AS ENUM ('text', 'ocr', 'mixed');
 
-enum ReportStatus {
-  completed
-  needs_review
-  extraction_failed
-}
+CREATE TABLE documents (
+  id                 uuid            PRIMARY KEY DEFAULT gen_random_uuid(),
+  file_name          varchar(255)    NOT NULL,
+  file_path          varchar(500)    NOT NULL,
+  file_hash          char(64)        NOT NULL,
+  file_size_bytes    int             NOT NULL,
+  status             document_status NOT NULL DEFAULT 'processing',
+  attempt_count      int             NOT NULL DEFAULT 0,
+  last_error_code    varchar(50),
+  last_error_message text,
+  is_retryable       boolean         NOT NULL DEFAULT true,
+  created_at         timestamptz     NOT NULL DEFAULT now(),
+  updated_at         timestamptz     NOT NULL DEFAULT now(),
+  CONSTRAINT uq_documents_file_hash UNIQUE (file_hash)
+);
+CREATE INDEX idx_documents_status_updated ON documents (status, updated_at);
+CREATE INDEX idx_documents_created ON documents (created_at DESC);
 
-enum ExtractionMethod {
-  text
-  ocr
-  mixed
-}
+CREATE TABLE extraction_attempts (
+  id                uuid              PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_fk       uuid              NOT NULL REFERENCES documents (id) ON DELETE CASCADE,
+  attempt_no        int               NOT NULL,
+  status            attempt_status    NOT NULL DEFAULT 'running',
+  failed_stage      extraction_stage,
+  error_code        varchar(50),
+  error_message     text,
+  extraction_method extraction_method,
+  rows_found        int,
+  parse_score       numeric(4,3),
+  duration_ms       int,
+  started_at        timestamptz       NOT NULL DEFAULT now(),
+  finished_at       timestamptz,
+  CONSTRAINT uq_attempts_document_attempt UNIQUE (document_fk, attempt_no)
+);
 
-model Report {
-  id               String           @id @default(uuid()) @db.Uuid
-  reportId         String           @map("report_id") @db.VarChar(100)
-  idAutoGenerated  Boolean          @default(false) @map("id_auto_generated")
-  patientName      String?          @map("patient_name") @db.VarChar(200)
-  reportDate       DateTime?        @map("report_date") @db.Date
-  labName          String           @default("UNKNOWN") @map("lab_name") @db.VarChar(200)
-  fileName         String           @map("file_name") @db.VarChar(255)
-  filePath         String           @map("file_path") @db.VarChar(500)
-  fileHash         String           @unique @map("file_hash") @db.Char(64)
-  fileSizeBytes    Int              @map("file_size_bytes")
-  pageCount        Int              @map("page_count")
-  extractionMethod ExtractionMethod @map("extraction_method")
-  status           ReportStatus
-  failureReason    String?          @map("failure_reason")
-  parseScore       Decimal?         @map("parse_score") @db.Decimal(4, 3)
-  warnings         Json             @default("[]")
-  rawText          String           @map("raw_text")
-  createdAt        DateTime         @default(now()) @map("created_at") @db.Timestamptz
-  updatedAt        DateTime         @updatedAt @map("updated_at") @db.Timestamptz
+CREATE TABLE reports (
+  id                uuid              PRIMARY KEY DEFAULT gen_random_uuid(),
+  document_fk       uuid              NOT NULL REFERENCES documents (id) ON DELETE CASCADE,
+  report_id         varchar(100)      NOT NULL,
+  id_auto_generated boolean           NOT NULL DEFAULT false,
+  patient_name      varchar(200),
+  report_date       date,
+  lab_name          varchar(200)      NOT NULL DEFAULT 'UNKNOWN',
+  page_count        int               NOT NULL,
+  extraction_method extraction_method NOT NULL,
+  parse_score       numeric(4,3),
+  warnings          jsonb             NOT NULL DEFAULT '[]'::jsonb,
+  raw_text          text              NOT NULL DEFAULT '',
+  created_at        timestamptz       NOT NULL DEFAULT now(),
+  updated_at        timestamptz       NOT NULL DEFAULT now(),
+  CONSTRAINT uq_reports_document UNIQUE (document_fk),
+  CONSTRAINT uq_reports_lab_report_id UNIQUE (lab_name, report_id)
+);
 
-  parameters ReportParameter[]
-
-  @@unique([labName, reportId])
-  @@index([createdAt])
-  @@map("reports")
-}
-
-model ReportParameter {
-  id            String   @id @default(uuid()) @db.Uuid
-  reportFk      String   @map("report_fk") @db.Uuid
-  rowOrder      Int      @map("row_order")
-  pageNumber    Int      @map("page_number")
-  isSection     Boolean  @default(false) @map("is_section")
-  sectionName   String?  @map("section_name") @db.VarChar(200)
-  name          String   @db.VarChar(300)
-  valueRaw      String?  @map("value_raw") @db.VarChar(200)
-  valueNumeric  Decimal? @map("value_numeric") @db.Decimal(18, 6)
-  comparator    String?  @db.VarChar(2)
-  unit          String?  @db.VarChar(50)
-  refRangeRaw   String?  @map("ref_range_raw") @db.VarChar(200)
-  refLow        Decimal? @map("ref_low") @db.Decimal(18, 6)
-  refHigh       Decimal? @map("ref_high") @db.Decimal(18, 6)
-  flag          String?  @db.VarChar(2)
-  ocrConfidence Decimal? @map("ocr_confidence") @db.Decimal(5, 2)
-  extra         Json?
-
-  report Report @relation(fields: [reportFk], references: [id], onDelete: Cascade)
-
-  @@index([reportFk, rowOrder])
-  @@index([name])
-  @@map("report_parameters")
-}
+CREATE TABLE report_parameters (
+  id              uuid          PRIMARY KEY DEFAULT gen_random_uuid(),
+  report_fk       uuid          NOT NULL REFERENCES reports (id) ON DELETE CASCADE,
+  row_order       int           NOT NULL,
+  page_number     int           NOT NULL,
+  is_section      boolean       NOT NULL DEFAULT false,
+  section_name    varchar(200),
+  name            varchar(300)  NOT NULL,
+  name_normalized varchar(300)  NOT NULL,
+  value_raw       varchar(200),
+  value_numeric   numeric(18,6),
+  comparator      varchar(2),
+  unit            varchar(50),
+  ref_range_raw   varchar(200),
+  ref_low         numeric(18,6),
+  ref_high        numeric(18,6),
+  flag            varchar(2),
+  ocr_confidence  numeric(5,2),
+  extra           jsonb
+);
+CREATE INDEX idx_parameters_report_order ON report_parameters (report_fk, row_order);
+CREATE INDEX idx_parameters_name_normalized ON report_parameters (name_normalized);
 ```
 
 **Design notes**
-- `labName` is **NOT NULL with default `UNKNOWN`**. PostgreSQL treats NULLs as distinct in unique indexes, so a nullable `lab_name` would let duplicate `(NULL, report_id)` pairs through.
-- `Decimal` (not `Float`) for values and ranges, so `0.1` stays exactly `0.1`.
-- `warnings` is a JSON array of `{ code, message }`, e.g. `{ "code": "ID_AUTO_GENERATED", "message": "…" }`.
+- `lab_name` is `NOT NULL DEFAULT 'UNKNOWN'`: PostgreSQL treats NULLs as distinct, so a nullable column would let duplicate `(NULL, report_id)` pairs through the unique constraint.
+- `numeric` (not float) keeps `0.1` exactly `0.1`. The `pg` driver returns NUMERIC as a string; `numericTransformer` converts it to a number on read.
+- Relation fields use TypeORM's `Relation<T>` wrapper, which avoids circular-import problems between entities in ESM.
+- `warnings` is a JSON array of `{ code, message }`; `extra` holds extra columns such as `{ "method": "CLIA" }`.
 
 ---
 
 ## 4. Shared Types (`extraction/types.ts`)
 
 ```ts
-export interface Word {
-  text: string;
-  x: number;          // left edge, top-left origin, PDF points
-  y: number;          // top edge
-  width: number;
-  height: number;
-  confidence?: number; // 0–100, OCR only
+interface Word { text: string; x: number; y: number; width: number; height: number; confidence?: number }
+// PDF points, top-left origin. OCR pixel coordinates are converted with × 72 / dpi.
+
+interface Line { page: number; y: number; words: Word[] /* sorted by x */; text: string }
+
+interface PageContent { page: number; source: 'text' | 'ocr'; lines: Line[]; ocrConfidence?: number }
+
+interface ParsedRow {
+  page: number; isSection: boolean; sectionName?: string;
+  name: string; nameNormalized: string;
+  valueRaw?: string; valueNumeric?: number; comparator?: string;
+  unit?: string; refRangeRaw?: string; refLow?: number; refHigh?: number;
+  flag?: 'H' | 'L'; ocrConfidence?: number; extra?: Record<string, string>;
 }
 
-export interface Line {
-  words: Word[];      // sorted by x
-  y: number;          // average y
-  text: string;       // words joined by single space
-  page: number;       // 1-based
+interface ReportMetadata { reportId?: string; patientName?: string; reportDate?: string /* yyyy-mm-dd */; labName?: string }
+
+interface ExtractionResult {
+  pageCount: number; method: ExtractionMethod; metadata: ReportMetadata;
+  rows: ParsedRow[]; score: number; ocrConfidence?: number; rawText: string;
+  warnings: { code: string; message: string }[];
 }
 
-export interface PageContent {
-  page: number;
-  source: 'text' | 'ocr';
-  lines: Line[];
-  ocrConfidence?: number;
-}
-
-export interface ParsedRow {
-  page: number;
-  isSection: boolean;
-  sectionName?: string;
-  name: string;
-  valueRaw?: string;
-  valueNumeric?: number;
-  comparator?: '<' | '>' | '<=' | '>=';
-  unit?: string;
-  refRangeRaw?: string;
-  refLow?: number;
-  refHigh?: number;
-  flag?: 'H' | 'L';
-  ocrConfidence?: number;
-  extra?: Record<string, string>;
-}
-
-export interface ReportMetadata {
-  reportId?: string;
-  patientName?: string;
-  reportDate?: Date;
-  labName?: string;
-}
-
-export interface Warning { code: string; message: string; }
-
-export interface ExtractionResult {
-  pageCount: number;
-  method: 'text' | 'ocr' | 'mixed';
-  metadata: ReportMetadata;
-  rows: ParsedRow[];
-  score: number;                    // 0–1
-  rawText: string;
-  warnings: Warning[];
-  failureReason?: string;           // set only when nothing could be parsed
+class ExtractionError extends Error {
+  constructor(code: string, stage: ExtractionStage, message: string, retryable: boolean, method?: ExtractionMethod)
 }
 ```
 
@@ -308,50 +247,44 @@ export interface ExtractionResult {
 
 ## 5. Error Handling
 
-### 5.1 Error codes (`common/errors/error-codes.ts`)
-| ErrorCode | HTTP | When |
-|---|---|---|
-| `FILE_MISSING` | 400 | No file in the request |
-| `INVALID_FILE_TYPE` | 400 | Wrong extension / MIME / missing `%PDF-` bytes |
-| `INVALID_ID` | 400 | `:id` is not a UUID |
-| `FILE_TOO_LARGE` | 413 | Over `MAX_UPLOAD_MB` |
-| `DUPLICATE_FILE` | 409 | Same SHA-256 already stored (response includes `existingReportId`) |
-| `DUPLICATE_REPORT_ID` | 409 | Same `(lab_name, report_id)` from a different file |
-| `CORRUPTED_PDF` | 422 | pdfjs cannot open the file |
-| `PASSWORD_PROTECTED` | 422 | pdfjs `PasswordException` |
-| `NO_PARAMETERS_FOUND` | 422 | Digital PDF with no table rows (nothing saved) |
-| `REPORT_NOT_FOUND` | 404 | Unknown report id |
-| `TOO_MANY_REQUESTS` | 429 | Throttler limit hit |
-| `INTERNAL_ERROR` | 500 | Anything unexpected |
+### 5.1 Error codes
+
+| Code | HTTP | Where | When |
+|---|---|---|---|
+| `FILE_MISSING` | 400 | PdfFilePipe | No file in the request |
+| `INVALID_FILE_TYPE` | 400 | PdfFilePipe | Wrong extension / MIME / missing `%PDF-` bytes |
+| `BAD_REQUEST` | 400 | ParseUUIDPipe / ParseIntPipe | Invalid `:id`, `page` or `limit` |
+| `FILE_TOO_LARGE` | 413 | Multer limit | Over `MAX_UPLOAD_MB` |
+| `DUPLICATE_FILE` | 409 | DocumentsService | Same SHA-256 already stored (`documentId`, `documentStatus`, `retryable` in body) |
+| `DUPLICATE_REPORT_ID` | 409 | DocumentsService | Unique violation on `(lab_name, report_id)` |
+| `ALREADY_PROCESSING` | 409 | DocumentsService.retry | Document is being processed |
+| `CORRUPTED_PDF` | 422 | pdf-reader | pdf.js cannot open the file (not retryable) |
+| `PASSWORD_PROTECTED` | 422 | pdf-reader | `PasswordException` (not retryable) |
+| `NO_PARAMETERS_FOUND` | 422 | ExtractionService | Digital PDF without table rows |
+| `OCR_NO_TABLE` | 422 | ExtractionService | Scanned PDF without table rows |
+| `OCR_LOW_CONFIDENCE` | 422 | ExtractionService | OCR confidence < 70% after the retry |
+| `EXTRACTION_ERROR` | 422 | ExtractionService | Unexpected error inside a stage |
+| `SAVE_FAILED` | 422 | DocumentsService | Database error while saving (transaction rolled back) |
+| `NOT_RETRYABLE` | 422 | DocumentsService.retry | Document failed with a non-retryable error |
+| `MAX_ATTEMPTS_REACHED` | 422 | DocumentsService.retry | Already tried 3 times |
+| `DOCUMENT_NOT_FOUND` | 404 | DocumentsService | Unknown id |
+| `DATABASE_DOWN` | 503 | AppController | Health check cannot reach PostgreSQL |
+| `INTERNAL_ERROR` | 500 | AllExceptionsFilter | Anything unexpected (details logged, not returned) |
+
+Every 422 from an extraction carries `documentId`, `stage` and `retryable`, so the UI can link to the document and show Retry.
 
 ### 5.2 `AppException`
 ```ts
-export class AppException extends HttpException {
-  constructor(
-    public readonly code: ErrorCode,
-    message: string,
-    status: HttpStatus,
-    public readonly extra: Record<string, unknown> = {},
-  ) { super({ code, message, ...extra }, status); }
+class AppException extends HttpException {
+  constructor(readonly code: string, message: string, status: HttpStatus, readonly extra: Record<string, unknown> = {})
+  // response body: { code, message, ...extra }
 }
 ```
 
-### 5.3 `AllExceptionsFilter` mapping
-| Caught | Response |
-|---|---|
-| `AppException` | its status + code |
-| `Prisma.PrismaClientKnownRequestError` `P2002` | 409 `DUPLICATE_REPORT_ID` |
-| `P2025` | 404 `REPORT_NOT_FOUND` |
-| `MulterError` `LIMIT_FILE_SIZE` | 413 `FILE_TOO_LARGE` |
-| `ThrottlerException` | 429 `TOO_MANY_REQUESTS` |
-| Other `HttpException` | pass through |
-| Anything else | 500 `INTERNAL_ERROR` (message hidden, full stack logged with request ID) |
-
-Response body:
-```json
-{ "statusCode": 409, "code": "DUPLICATE_FILE", "message": "This PDF has already been uploaded.",
-  "existingReportId": "…", "requestId": "…", "timestamp": "…" }
-```
+### 5.3 `AllExceptionsFilter`
+- `HttpException` → its status; body gets `code` (default by status: 400 `BAD_REQUEST`, 404 `NOT_FOUND`, 409 `CONFLICT`, 413 `FILE_TOO_LARGE`, 422 `UNPROCESSABLE`); array messages joined.
+- Anything else → 500 `INTERNAL_ERROR` with a generic message; the stack is logged.
+- Final body: `{ statusCode, code, message, ...extra, path, timestamp }`.
 
 ---
 
@@ -359,336 +292,286 @@ Response body:
 
 ### 6.1 `main.ts`
 - `app.setGlobalPrefix('api')`
-- `app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }))` (PDF iframe from another port)
-- `app.enableCors({ origin: FRONTEND_URL })`
-- `app.useGlobalPipes(new ValidationPipe({ whitelist: true, transform: true }))`
-- `app.useGlobalFilters(new AllExceptionsFilter())`
-- `server.setTimeout(UPLOAD_TIMEOUT_MS)` for long OCR requests
+- `app.enableCors({ origin: FRONTEND_URL, exposedHeaders: ['X-Request-Id'] })`
+- `helmet({ crossOriginResourcePolicy: 'cross-origin', frameguard: false, CSP frame-ancestors 'self' FRONTEND_URL })` – the frontend (another origin) embeds the PDF in an iframe.
+- `app.useGlobalFilters(new AllExceptionsFilter())`, `app.enableShutdownHooks()`.
 
 ### 6.2 `RequestLoggerMiddleware`
+Reuses `X-Request-Id` or creates a UUID, returns it as a response header, and on `finish` logs `METHOD url status ms [requestId]`. Applied to every route in `AppModule.configure`.
+
+### 6.3 `PdfFilePipe`
+```
+!file                                                   → 400 FILE_MISSING
+name ends with .pdf AND mimetype in [application/pdf, application/x-pdf, application/octet-stream]
+  AND first 5 bytes == '%PDF-'                          → ok, else 400 INVALID_FILE_TYPE
+```
+
+### 6.4 `DocumentsController` (`/api/documents`)
 ```ts
-use(req, res, next): void
-// requestId = req.headers['x-request-id'] ?? randomUUID(); set on req + response header
-// on res 'finish': log `${method} ${url} ${status} ${ms}ms [${requestId}]`
+@Post('upload') @UseInterceptors(FileInterceptor('file', { storage: memoryStorage(), limits: { fileSize: MAX_UPLOAD_BYTES, files: 1 } }))
+upload(@UploadedFile(PdfFilePipe) file)                                     // 201 DocumentDetail
+
+@Get() list(@Query('page', DefaultValuePipe(1), ParseIntPipe) page,
+            @Query('limit', DefaultValuePipe(20), ParseIntPipe) limit)     // limit clamped to 1..100
+
+@Get(':id')        findOne(@Param('id', ParseUUIDPipe) id)
+@Get(':id/file')   file(id, @Res() res)   // streams the PDF, Content-Type application/pdf, inline,
+                                          // CSP only "frame-ancestors" so the browser PDF viewer works
+@Post(':id/retry') @HttpCode(200) retry(id)
+@Delete(':id')     @HttpCode(204) remove(id)
 ```
 
-### 6.3 `PdfFileValidationPipe`
+### 6.5 `DocumentsService`
+
+**`upload(file)`**
+```
+1. fileHash = sha256(buffer)
+2. existing = findOneBy({ fileHash }) → 409 DUPLICATE_FILE { documentId, documentStatus, retryable }
+3. filePath = storage.save(fileHash, buffer)                 // storage/<hash>.pdf
+4. INSERT documents (status processing, attemptCount 1)
+     unique violation (same file at the same moment) → 409 DUPLICATE_FILE for the winner
+5. return runAttempt(document, 1, buffer)
+```
+
+**`retry(id)`**
+```
+1. document = findDocument(id)                                   → 404
+2. !isRetryable                → 422 NOT_RETRYABLE
+3. attemptCount >= MAX_ATTEMPTS → 422 MAX_ATTEMPTS_REACHED
+4. UPDATE documents SET status='processing', attempt_count = attempt_count + 1
+   WHERE id = $1 AND status <> 'processing' AND attempt_count < 3 RETURNING attempt_count
+   no row → 409 ALREADY_PROCESSING                              // atomic claim
+5. buffer = storage.read(filePath); return runAttempt(document, attemptNo, buffer)
+```
+
+**`runAttempt(document, attemptNo, buffer)`**
+```
+attempt = INSERT extraction_attempts (attemptNo, running)
+try result = extraction.extract(buffer)
+catch → markFailed(stage, code, message, retryable) ; throw 422 { documentId, stage, retryable }
+
+{ reportId, idAutoGenerated } = resolveReportId(metadata.reportId, fileHash)
+warnings: ID_AUTO_GENERATED (if generated) + extraction warnings
+needsReview = score < 0.7 OR ocrConfidence < 85 → add NEEDS_REVIEW warning
+
+TRANSACTION:
+  DELETE reports WHERE document_fk = id           // a retry replaces the old report (params cascade)
+  INSERT reports (...)
+  INSERT report_parameters (rowOrder = index in rows, ...)
+  UPDATE extraction_attempts → success, method, rowsFound, parseScore, durationMs, finishedAt
+  UPDATE documents → completed | needs_review, clear last error
+on unique violation (lab_name, report_id) → delete the new document + file, 409 DUPLICATE_REPORT_ID
+on other DB error → markFailed(stage save, SAVE_FAILED, retryable) ; 422
+return findOne(id)
+```
+
+**`markFailed`** updates the attempt (failed, stage, code, message, method, duration) and the document (failed, last error, `is_retryable`).
+
+**`onApplicationBootstrap()`** – restart recovery: attempts `running` and documents `processing` older than 10 minutes become `failed` / `INTERRUPTED` (retryable).
+
+**`list(page, limit)`** – `findAndCount` with the report relation, newest first; parameter counts per report from one `GROUP BY report_fk` query (sections excluded).
+
+**`findOne(id)`** – document with report, parameters ordered by `row_order`, attempts ordered by `attempt_no`; mapped by `toDocumentDetail`.
+
+**`remove(id)`** – delete the document (attempts, report and parameters cascade) and the stored file.
+
+**`resolveReportId(found, fileHash)`** – found → trimmed, upper-case, max 100 chars; else `AUTO-<yyyymmdd>-<first 6 of hash, upper-case>`.
+
+### 6.6 `FileStorageService`
 ```ts
-transform(file?: Express.Multer.File): Express.Multer.File
-// 1. !file                                   → FILE_MISSING
-// 2. !originalname.toLowerCase().endsWith('.pdf') → INVALID_FILE_TYPE
-// 3. mimetype not in ['application/pdf','application/x-pdf','application/octet-stream'] → INVALID_FILE_TYPE
-// 4. buffer.subarray(0,5).toString() !== '%PDF-'                                      → INVALID_FILE_TYPE
+save(hash, buffer): Promise<string>   // mkdir -p STORAGE_DIR; write <hash>.pdf; return relative path
+read(relative): Promise<Buffer>
+stream(relative): ReadStream
+delete(relative): Promise<void>       // force: no error if already gone
+// resolve() refuses any path that would leave STORAGE_DIR
 ```
 
-### 6.4 `ReportsController`
-```ts
-@Controller('reports')
-class ReportsController {
-  @Post('upload') @UseGuards(ThrottlerGuard)
-  @UseInterceptors(FileInterceptor('file', { storage: memoryStorage(), limits: { fileSize } }))
-  upload(@UploadedFile(PdfFileValidationPipe) file): Promise<ReportDetailResponse>     // 201
-
-  @Get()            list(@Query() q: ListReportsQueryDto): Promise<Paginated<ReportSummary>>
-  @Get(':id')       get(@Param('id', ParseUUIDPipe) id): Promise<ReportDetailResponse>
-  @Get(':id/raw-text') rawText(@Param('id', ParseUUIDPipe) id): Promise<{ rawText: string }>
-  @Get(':id/file')  file(@Param('id', ParseUUIDPipe) id, @Res() res): Promise<void> // stream, Content-Type application/pdf, inline
-  @Post(':id/reprocess') reprocess(@Param('id', ParseUUIDPipe) id): Promise<ReportDetailResponse>
-  @Delete(':id') @HttpCode(204) remove(@Param('id', ParseUUIDPipe) id): Promise<void>
-}
-```
-
-`ListReportsQueryDto`: `page` (int ≥ 1, default 1), `limit` (int 1–100, default 20).
-
-### 6.5 `ReportsService`
-
-```ts
-async upload(file): Promise<ReportDetailResponse>
-```
-```
-1. hash = sha256(file.buffer)
-2. existing = repo.findByHash(hash)
-   if existing → throw DUPLICATE_FILE { existingReportId: existing.id }
-3. result = extraction.extract(file.buffer)          // may throw CORRUPTED_PDF / PASSWORD_PROTECTED
-4. isScanned = result.method !== 'text'
-   if result.rows.length === 0:
-       if !isScanned → throw NO_PARAMETERS_FOUND (nothing saved)
-       status = extraction_failed
-   else status = result.score < REVIEW_SCORE_THRESHOLD ? needs_review : completed
-5. { reportId, idAutoGenerated } = resolveReportId(result.metadata.reportId, hash)
-   if idAutoGenerated → warnings.push(ID_AUTO_GENERATED)
-6. labName = metadata.labName ?? 'UNKNOWN'
-   if repo.existsByLabAndReportId(labName, reportId) → throw DUPLICATE_REPORT_ID
-7. filePath = storage.save(hash, file.buffer)        // storage/<hash>.pdf
-8. try   report = repo.createWithParameters({...}, rows)   // one transaction
-   catch → storage.delete(filePath); rethrow             // no orphan files
-9. return toDetailResponse(report)
-```
-
-```ts
-resolveReportId(found: string | undefined, hash: string): { reportId: string; idAutoGenerated: boolean }
-// found → { found.trim().toUpperCase(), false }
-// else  → { `AUTO-${yyyymmdd(now)}-${hash.slice(0, 6)}`, true }
-```
-
-```ts
-async reprocess(id): Promise<ReportDetailResponse>
-// load report (404) → buffer = storage.read(filePath) → extraction.extract(buffer)
-// recompute status / metadata / warnings as in upload
-// repo.replaceParameters(id, reportFields, rows)   // transaction: update report, deleteMany params, createMany params
-```
-
-`list`, `get`, `getRawText`, `getFile`, `remove` are thin calls to the repository (`remove` also deletes the stored file).
-
-### 6.6 `ReportsRepository`
-```ts
-findByHash(hash: string): Promise<Report | null>
-existsByLabAndReportId(lab: string, reportId: string, excludeId?: string): Promise<boolean>
-createWithParameters(data: ReportCreateInput, rows: ParsedRow[]): Promise<ReportWithParams>  // $transaction
-replaceParameters(id: string, data: ReportUpdateInput, rows: ParsedRow[]): Promise<ReportWithParams>
-findPage(page: number, limit: number): Promise<{ items: ReportSummary[]; total: number }>   // includes _count.parameters
-findById(id: string): Promise<ReportWithParams | null>   // parameters ordered by rowOrder asc
-delete(id: string): Promise<void>
-```
-Row → DB mapping: `rowOrder` = index in `rows`.
-
-### 6.7 `FileStorageService`
-```ts
-save(hash: string, buffer: Buffer): Promise<string>   // writes STORAGE_DIR/<hash>.pdf, returns relative path
-read(path: string): Promise<Buffer>
-createReadStream(path: string): ReadStream
-delete(path: string): Promise<void>                   // ignores ENOENT
-```
+### 6.7 `documents.mapper.ts`
+`toDocumentSummary(document, parameterCount)` and `toDocumentDetail(document)` build the response objects explicitly, so `file_path` and `file_hash` never reach the client. `canRetry = status failed AND is_retryable AND attempt_count < 3`.
 
 ---
 
 ## 7. Extraction Engine
 
-### 7.1 `ExtractionService.extract(buffer): Promise<ExtractionResult>`
+### 7.1 `ExtractionService.extract(buffer)`
 ```
-doc = pdfLoader.load(buffer)                       // throws CORRUPTED_PDF / PASSWORD_PROTECTED
-pages: PageContent[] = []
-for p in 1..doc.numPages:
-    words = textExtractor.getWords(doc, p)
-    if totalChars(words) >= TEXT_PAGE_MIN_CHARS:
-        pages.push({ page: p, source: 'text', lines: lineBuilder.build(words, p, 'text') })
-    else:
-        pages.push(ocrPage(doc, p, attempt = 1))
+{ doc, close } = loadPdf(buffer)                      // CORRUPTED_PDF / PASSWORD_PROTECTED, not retryable
+for each page:
+    words = extractPageWords(doc, p)
+    chars >= 20 → text page: buildLines(words)
+    else        → scanned page
+method = text | ocr | mixed
 
-method   = all text → 'text' | all ocr → 'ocr' | else 'mixed'
-rawText  = pages.flatMap(lines).map(l => l.text).join('\n')   (with "--- page N ---" markers)
-metadata = metadataParser.parse(first page lines)
-{ rows, score } = tableParser.parse(pages)
+pass = runPass(dpi 300, PSM 6, no clean-up)          // OCR only for scanned pages, then parseTable
+if scanned pages AND (no rows OR OCR confidence < 75):
+    retry = runPass(dpi 300, PSM 4, clean-up)
+    add warning OCR_RETRIED
+    keep retry if its score is higher (tie: more rows)
 
-// OCR retry: if any page is OCR and (rows empty OR avg OCR confidence < OCR_MIN_CONFIDENCE)
-if needsRetry:
-    re-run ocrPage(doc, p, attempt = 2) for the OCR pages, parse again
-    keep whichever attempt has the higher score (tie → more rows)
-
-if rows empty and method != 'text':
-    failureReason = `Could not read a table from the scanned PDF (OCR confidence ${conf}%). The image quality may be too low.`
-
-warnings: OCR_USED, OCR_RETRIED, LOW_CONFIDENCE_ROWS(n), MULTI_PAGE_TABLE(n pages), NEEDS_REVIEW
-return result
+ocrConfidence < 70             → ExtractionError OCR_LOW_CONFIDENCE (stage ocr, retryable)
+no data rows                   → NO_PARAMETERS_FOUND (digital) / OCR_NO_TABLE (scanned), stage parse, retryable
+metadata = parseMetadata(first page lines above the header, or first 25 lines)
+warnings: OCR_USED, MULTI_PAGE_TABLE, INVALID_RANGE
+rawText = per page "--- page N (text|ocr) ---" + lines
+close()
 ```
+`stage(stage, fn)` wraps each step so an unexpected error becomes `EXTRACTION_ERROR` tagged with the stage it happened in.
 
-`ocrPage(doc, p, attempt)`:
-| | Attempt 1 | Attempt 2 (retry) |
-|---|---|---|
-| Render DPI | `OCR_DPI` (300) | `OCR_RETRY_DPI` (400) |
-| Pre-processing | greyscale + normalise | greyscale + normalise + threshold (binarise) + median(1) |
-| Tesseract PSM | 6 (single uniform block) | 4 (single column of variable sizes) |
+### 7.2 `pdf-reader.ts`
+- **`loadPdf(buffer)`** – `getDocument({ data: new Uint8Array(buffer), disableFontFace: true, verbosity: 0 })`. The buffer is copied because pdf.js can detach it and the same buffer is reused on retry. Returns `{ doc, close }` (`close` destroys the loading task).
+- **`extractPageWords(doc, page)`** – for each text item: `x = transform[4]`, `y = pageHeight - transform[5] - height` (top-left origin), then split into single words with an x estimated from the average character width. Splitting makes digital pages look like OCR output, so one parser handles both.
+- **`renderPage(doc, page, { dpi, binarize })`** – `@napi-rs/canvas` at `dpi / 72` scale, white background, `page.render`, PNG.
+- **`cleanScan(pixels)`** (retry only) – greyscale < 170 → ink, then a 3×3 median filter (a pixel is ink if ≥ 5 of its 9 neighbours are ink). This removes scanner specks but keeps letter strokes.
 
-OCR word coordinates are converted from pixels to PDF points (`× 72 / dpi`) so the same parser thresholds apply.
-
-### 7.2 `PdfLoader.load(buffer): Promise<PDFDocumentProxy>`
-- `pdfjs-dist/legacy/build/pdf.mjs` is ESM, so it is loaded with a cached dynamic `import()` from the CommonJS NestJS build.
-- `getDocument({ data: new Uint8Array(buffer), disableFontFace: true, isEvalSupported: false })`
-- `PasswordException` → `PASSWORD_PROTECTED`; any other error → `CORRUPTED_PDF`.
-
-### 7.3 `TextExtractor.getWords(doc, pageNo): Promise<Word[]>`
-```
-page = doc.getPage(pageNo); viewport = page.getViewport({ scale: 1 })
-content = page.getTextContent()
-for item in content.items where item.str.trim() != '':
-    [ , , , , tx, ty] = item.transform
-    x = tx; height = item.height || abs(item.transform[3])
-    y = viewport.height - ty - height           // flip to top-left origin
-    split item.str on 2+ spaces into separate Words (x advanced proportionally by char width)
-```
-Splitting on 2+ spaces matters because some PDFs put a whole row into one text item.
-
-### 7.4 `PageRenderer.render(doc, pageNo, dpi): Promise<Buffer>`
-`scale = dpi / 72` → `@napi-rs/canvas` `createCanvas(w, h)` → `page.render({ canvasContext, viewport })` → `canvas.toBuffer('image/png')`.
-
-### 7.5 `ImagePreprocessor`
+### 7.3 OCR
 ```ts
-basic(png: Buffer): Promise<Buffer>   // sharp(png).greyscale().normalise().png()
-strong(png: Buffer): Promise<Buffer>  // sharp(png).greyscale().normalise().median(1).threshold(170).png()
-```
-
-### 7.6 OCR provider
-```ts
-export interface OcrProvider {
-  recognize(image: Buffer, opts: { psm: number }): Promise<{ words: Word[]; confidence: number }>;
+interface OcrProvider {
+  recognize(png: Buffer, opts: { dpi: number; page: number; psm: number }): Promise<{ lines: Line[]; confidence: number }>;
 }
 ```
-`TesseractOcrProvider` (implements `OnModuleInit`, `OnModuleDestroy`):
-- `onModuleInit`: `createWorker('eng', OEM.LSTM_ONLY, { langPath: TESSDATA_DIR, cacheMethod: 'none', gzip: false })` – created **once**, reused.
-- `recognize`: `worker.setParameters({ tessedit_pageseg_mode: psm, preserve_interword_spaces: '1' })` → `worker.recognize(image, {}, { blocks: true })` → flatten `blocks → paragraphs → lines → words` into `Word { text, x: bbox.x0, y: bbox.y0, width, height, confidence }`; drop words with confidence < 30 and empty text.
-- `onModuleDestroy`: `worker.terminate()`.
-- Registered under an injection token `OCR_PROVIDER`, so a different provider can be swapped in.
+`TesseractOcrProvider` (registered under the `OCR_PROVIDER` token):
+- one worker, created on first use: `createWorker('eng', OEM.LSTM_ONLY, { langPath: <@tesseract.js-data/eng>/4.0.0_best_int, cacheMethod: 'none' })`;
+- `setParameters({ tessedit_pageseg_mode: psm, preserve_interword_spaces: '1' })`, `recognize(png, {}, { blocks: true })`;
+- uses Tesseract's own lines (they handle slightly tilted scans better than grouping by y), drops words with confidence < 30, converts pixels to points (× 72 / dpi);
+- `confidence` = average word confidence; the worker is terminated in `onModuleDestroy`.
 
 ---
 
 ## 8. Parsing Algorithms
 
-### 8.1 `LineBuilder.build(words, page, source): Line[]`
-```
-tolerance = source === 'text' ? 3 : 0.5 * median(word.height)
-sort words by y, then x
-for each word: put into the current line if |word.centerY - line.centerY| <= tolerance, else start a new line
-sort each line's words by x; line.text = words.map(text).join(' ')
-```
+### 8.1 `buildLines(words, page)`
+`tolerance = max(3, 0.5 × median word height)`. Words are sorted by vertical centre; a word joins the current line when its centre is within the tolerance of the line's average centre, otherwise a new line starts. Each line's words are sorted by x and joined with spaces.
 
-### 8.2 `header-synonyms.ts`
-```ts
-export const COLUMN_SYNONYMS: Record<ColumnKey, string[]> = {
-  name:  ['test', 'test name', 'test description', 'investigation', 'parameter', 'examination', 'analyte'],
-  value: ['result', 'results', 'value', 'observed value', 'observation', 'your value', 'reading'],
-  unit:  ['unit', 'units', 'uom'],
-  range: ['reference range', 'ref range', 'ref. range', 'normal range', 'normal value',
-          'biological ref', 'biological reference interval', 'reference interval', 'reference'],
-  flag:  ['flag', 'status'],
-  method:['method', 'methodology'],
-};
-export const STOP_WORDS = ['end of report', 'pathologist', 'interpretation', 'authorised by',
-                           'authorized by', 'signature', 'note:', 'comments', '*** end'];
-export const KNOWN_UNITS = ['g/dl','mg/dl','mmol/l','µmol/l','umol/l','iu/l','u/l','%','fl','pg',
-                            'cells/µl','cells/cumm','/cumm','10^3/µl','10^6/µl','mill/cumm',
-                            'lakh/cumm','mg/l','ng/ml','pg/ml','µiu/ml','miu/l','meq/l','mm/hr','sec','ratio'];
-```
-Matching normalises text: lower-case, remove `.`, `:`, `()`, collapse spaces.
+### 8.2 `dictionaries.ts`
+- `COLUMN_SYNONYMS` – `name` (test, test name, investigation, parameter, examination, analyte…), `value` (result, observed value, value, observation…), `unit` (unit, units, uom), `range` (reference range, biological ref interval, normal range, ref range, reference…), `flag`, `method`.
+- `STOP_PHRASES` – end of report, pathologist, interpretation, authorised/authorized by, signature, disclaimer, note:.
+- `SKIP_PHRASES` – continued on next page, continued..., page.
+- `KNOWN_UNITS`, `UNIT_ALIASES` (gm/dl → g/dL, uiu/ml → µIU/mL…), `TEST_NAME_SYNONYMS` (Hb/Haemoglobin → Hemoglobin, FBS → Glucose, Fasting…).
 
-### 8.3 `MetadataParser.parse(lines): ReportMetadata`
-Searches the lines **above the table header** (or the first 25 lines):
-| Field | Pattern (case-insensitive) |
+Matching uses `nameKey()`: lower-case, non-alphanumerics → space, spaces collapsed.
+
+### 8.3 `parseMetadata(lines)`
+| Field | Rule |
 |---|---|
-| reportId | `(report\s*id\|sample\s*id\|sample\s*no\|lab\s*no\|accession\s*no\|reg(istration)?\.?\s*no\|barcode)\s*[:#.-]?\s*([A-Z0-9][A-Z0-9\-/]{2,})` |
-| patientName | `(patient\s*name\|patient\|name)\s*[:.-]\s*(?:mr\.?\|mrs\.?\|ms\.?)?\s*([A-Za-z .]{2,60}?)(?=\s{2,}\|age\|sex\|$)` |
-| reportDate | label `(report(ed)?\s*date\|date)` followed by `dd/mm/yyyy`, `dd-mm-yyyy`, `dd-Mon-yyyy` or `yyyy-mm-dd`; parsed as day-first; invalid dates ignored |
-| labName | first non-empty line on page 1 that contains `lab`, `diagnostic`, `pathology` or `clinic`; else `UNKNOWN` |
+| reportId | `report id / sample id / sample no / lab no / accession no / reg(istration) no / barcode / specimen id` + optional `:#.-` + `[A-Z0-9][A-Z0-9-/]{2,99}`, upper-cased |
+| patientName | `patient name / patient / name` + `:` or `-`, optional title (Mr, Mrs, Ms, Miss, Master, Baby), stops before the next label (age, sex, sample, lab, date, referred…) |
+| reportDate | `report(ed) on/date / collected on / date` + `dd/mm/yyyy`, `dd-Mon-yyyy` or `yyyy-mm-dd`; day-first; invalid, before 1900 or future → ignored |
+| labName | first of the top 4 lines containing lab, laboratory, diagnostic(s), pathology, clinic, hospital, health |
 
-### 8.4 Strategy 1 – `HeaderTableStrategy.parse(pages): ParsedRow[]`
+### 8.4 `parseTable(pages)`
+Runs both strategies, cleans both results with `cleanRows`, scores them, and keeps the **header strategy unless the line-pattern score is more than 0.1 higher**.
+`score = data rows with a name and (value or unit or range) ÷ data rows` (a missing value can be legitimate).
+
+**Strategy 1 – header (`matchHeader` + `headerStrategy`)**
 ```
+matchHeader(line): scan words left to right; at each position try synonym phrases longest first
+                   (1-4 words); a header needs a 'name' AND a 'value' column
 for each page:
-    headerLine = first line where matchColumns(line) contains both 'name' and 'value'
-    if none and this page continues a table from the previous page → reuse previous column layout
-    if none and no previous layout → skip page
-    columns = for each matched header word: { key, xStart: word.x }
-              sorted by xStart; column boundary = midpoint between neighbours' xStart
-              (first column starts at 0, last ends at +∞)
-    for each line after headerLine:
-        if line matches a STOP_WORD → stop table (for this and later pages)
-        if line is a repeat of the header → skip
-        cells = assign each word to the column whose [start, end) contains word.x; join words per column
-        row = { name: cells.name, valueRaw: cells.value, unit: cells.unit, refRangeRaw: cells.range,
-                extra: { method: cells.method }, page }
-        rows.push(row)
-return rowPostprocessor.process(rows)
+    header found → columns = matched words sorted by x (start = word.x)
+    no header but earlier page had one → reuse its columns (table continues)
+    for each line after the header:
+        STOP phrase → stop the whole table
+        SKIP phrase or repeated header → skip
+        each word goes to the right-most column whose start <= word.x + 8
+        cells = words joined per column; OCR rows keep their average confidence
 ```
-`matchColumns(line)` tries 1-, 2- and 3-word windows against the synonym list, so multi-word headers like `Biological Ref. Interval` match.
-
-### 8.5 Strategy 2 – `LineRegexStrategy.parse(pages): ParsedRow[]`
-For each line (between the first and last plausible row, stopping at STOP_WORDS):
+**Strategy 2 – line pattern**
 ```
-^(?<name>[A-Za-z][A-Za-z0-9 ()/,.&%+-]*?)\s+
- (?<value>[<>]=?\s*\d+(?:\.\d+)?|\d+(?:\.\d+)?|positive|negative|reactive|non[- ]reactive|nil|absent|present|trace|detected|not detected)
- (?:\s*(?<flag>\bH\b|\bL\b|\*|↑|↓))?
- (?:\s+(?<unit>[A-Za-zµ%/^0-9.]+(?:\/[A-Za-zµ0-9.^]+)?))?
- (?:\s+(?<range>.+))?$                                         (case-insensitive)
+start after the header line if the page has one; stop at STOP phrases; skip "Label: value" lines
+^<name> <value: [<>]=?number | number | result word> [H|L|*] [rest]$
+first word of rest that is a known unit → unit; the remainder → range
+lines that do not match but look like a heading / wrapped name are kept as name-only rows
 ```
-`unit` is accepted only if it is in `KNOWN_UNITS` or looks like `x/y`; otherwise that text is treated as the start of the range.
 
-### 8.6 `RowPostprocessor.process(rows): ParsedRow[]`
-Applied in this order:
-1. **Trim** every cell; empty strings → `undefined`.
-2. **Section headings** – a row with a name, no value, no unit, no range, and (all upper-case **or** ends with `:`) → `isSection = true`. Following rows get `sectionName`.
-3. **Wrapped names** – a row with only a name, not a section, directly after a data row on the same page → append to that row's name (`Glucose Fasting` + `(Plasma)`).
-4. **Unit stuck to value** – `^([<>]=?\s*\d+(?:\.\d+)?)\s*([A-Za-zµ%/].*)$` on `valueRaw` with no unit → split.
-5. **Flag** – trailing ` H`, ` L`, `*`, `↑`, `↓` on `valueRaw` → `flag` (`*`/`↑` → `H`, `↓` → `L`). A separate `flag` column is also respected.
-6. **OCR fixes** (OCR rows only, value column only) – `O/o → 0`, `l/I → 1`, `S → 5` **only when** the rest of the cell is numeric.
-7. **Parse** value with `ValueParser` and range with `RangeParser`.
-8. **Drop junk** – rows whose name is empty or is just digits/punctuation.
-9. **Compute flag** when none was printed but `valueNumeric` and the range exist (`> refHigh` → `H`, `< refLow` → `L`).
+### 8.5 `cleanRows(rawRows)`
+Applied in order:
+1. Trim cells; empty → undefined.
+2. **Name-only row:** no digits and (all capitals with ≥ 3 letters, or ends with `:`) → **section** (following rows get `sectionName`); otherwise, if the previous row is a data row on the same page → **appended to its name**.
+3. **Junk:** name without two letters in a row → dropped.
+4. OCR rows: `fixOcrDigits` on the value (`O→0`, `l/I→1`, `S→5` only when the cell is otherwise numeric).
+5. `splitValueUnit` (`13.5g/dL`) when there is no unit column value; `splitFlag` (`128 H`, `245*`, `↑`, `↓`).
+6. A printed `flag` column (`H`/`L`) is used when the value had none.
+7. `parseValue` → `valueNumeric`, `comparator`. **OCR rows whose value is neither a number nor a result word are dropped** (noise).
+8. `parseRange` → `refLow`, `refHigh`; a reversed range adds a warning and keeps only the raw text.
+9. **Calculated flag** (text rows only, no comparator): value > `refHigh` → H, value < `refLow` → L.
+10. `extra.method` from a Method column; lengths cut to the column sizes (name 300, value 200, unit 50, range 200).
+11. `nameNormalized = normalizeTestName(name)` after wrapped names are joined.
 
-### 8.7 `ValueParser.parse(raw?): { valueNumeric?, comparator? }`
-| Input | Output |
+### 8.6 `value-parsers.ts`
+| Function | Behaviour |
 |---|---|
-| `13.5` | `{ valueNumeric: 13.5 }` |
-| `1,50,000` / `150,000` | `{ valueNumeric: 150000 }` (commas removed) |
-| `<5`, `< 5`, `<=5` | `{ valueNumeric: 5, comparator: '<' / '<=' }` |
-| `>1000` | `{ valueNumeric: 1000, comparator: '>' }` |
-| `Positive`, `Nil`, `Reactive`, `Trace` | `{}` (only `valueRaw` is kept) |
-| `undefined` / `-` / `--` | `{}` |
-
-### 8.8 `RangeParser.parse(raw?): { refLow?, refHigh? }`
-| Pattern | Example | Result |
-|---|---|---|
-| `a - b` / `a – b` / `a to b` | `13.0 - 17.0` | low 13, high 17 |
-| `< b` / `<= b` / `up to b` / `upto b` / `below b` | `< 200` | high 200 |
-| `> a` / `>= a` / `above a` | `> 40` | low 40 |
-| Gender/age-specific, text, anything else | `M: 13-17 F: 12-15`, `Negative` | nothing (raw text kept) |
-
-### 8.9 `TableParser.parse(pages): { rows, score }`
-```
-candidates = [headerStrategy.parse(pages), lineRegexStrategy.parse(pages)]
-score(rows) = rows.length === 0 ? 0
-            : count(r => !r.isSection && r.name && r.valueRaw) / count(r => !r.isSection)
-best = candidate with highest score; tie → more rows; tie → header strategy
-```
+| `parseValue` | commas removed; `^([<>]=?)?\s*-?\d+(\.\d+)?$` → number + comparator; anything else → nothing |
+| `parseRange` | `a - b` / `a – b` / `a to b` (rejected if a > b); `< b`, `<= b`, `up to b`, `below b`; `> a`, `>= a`, `above a`; anything else → nothing |
+| `splitFlag` | trailing `H`, `L`, `*`, `↑`, `↓` only when the rest is numeric; `*`/`↑` → H, `↓` → L |
+| `splitValueUnit` | `^((?:[<>]=?)?\s*\d[\d.,]*)\s*(unit)$` and the unit must pass `isUnit` |
+| `isUnit` | in `KNOWN_UNITS` or shaped like `x/y` (Greek μ treated as µ) |
+| `normalizeUnit` | Greek μ → micro sign µ, then `UNIT_ALIASES` |
+| `normalizeTestName` | synonym lookup on the cleaned name, then without bracket notes, then without serum/plasma/blood; unknown names are only tidied |
 
 ---
 
 ## 9. API Contract
 
-### `POST /api/reports/upload` → 201
+### `POST /api/documents/upload` → 201
 Request: `multipart/form-data`, field `file`.
 ```json
 {
-  "id": "6b1e…",
-  "reportId": "SMP-20481",
-  "idAutoGenerated": false,
-  "patientName": "Ramesh Patil",
-  "reportDate": "2026-11-18",
-  "labName": "CITY DIAGNOSTIC LAB",
+  "id": "61c20f1a-…",
   "fileName": "01-basic-8-params.pdf",
-  "pageCount": 1,
-  "extractionMethod": "text",
+  "fileSizeBytes": 2270,
   "status": "completed",
-  "failureReason": null,
-  "parseScore": 1,
-  "warnings": [],
-  "createdAt": "2026-11-22T06:30:00.000Z",
-  "parameters": [
-    { "rowOrder": 0, "page": 1, "isSection": false, "sectionName": null,
-      "name": "Hemoglobin", "valueRaw": "13.5", "valueNumeric": 13.5, "comparator": null,
-      "unit": "g/dL", "refRangeRaw": "13.0 - 17.0", "refLow": 13, "refHigh": 17,
-      "flag": null, "ocrConfidence": null, "extra": null }
+  "attemptCount": 1,
+  "lastErrorCode": null,
+  "lastErrorMessage": null,
+  "canRetry": false,
+  "createdAt": "2026-11-22T09:36:00.000Z",
+  "updatedAt": "2026-11-22T09:36:00.000Z",
+  "report": {
+    "id": "…",
+    "reportId": "SMP-20481",
+    "idAutoGenerated": false,
+    "patientName": "Ramesh Patil",
+    "reportDate": "2026-11-18",
+    "labName": "CITY DIAGNOSTIC LABORATORY",
+    "pageCount": 1,
+    "extractionMethod": "text",
+    "parseScore": 1,
+    "warnings": [],
+    "rawText": "--- page 1 (text) ---\n…",
+    "parameterCount": 8,
+    "createdAt": "…",
+    "parameters": [
+      { "rowOrder": 2, "pageNumber": 1, "isSection": false, "sectionName": null,
+        "name": "Creatinine", "nameNormalized": "Creatinine",
+        "valueRaw": "0.9", "valueNumeric": 0.9, "comparator": null,
+        "unit": "mg/dL", "refRangeRaw": "0.6 - 1.3", "refLow": 0.6, "refHigh": 1.3,
+        "flag": null, "ocrConfidence": null, "extra": null }
+    ]
+  },
+  "attempts": [
+    { "attemptNo": 1, "status": "success", "failedStage": null, "errorCode": null, "errorMessage": null,
+      "extractionMethod": "text", "rowsFound": 8, "parseScore": 1, "durationMs": 120,
+      "startedAt": "…", "finishedAt": "…" }
   ]
 }
 ```
-Decimals are converted to JS numbers in the response mapper.
 
-### `GET /api/reports?page=1&limit=20` → 200
+### Failed extraction → 422
 ```json
-{ "items": [ { "id": "…", "reportId": "SMP-20481", "patientName": "…", "reportDate": "…",
-               "labName": "…", "extractionMethod": "text", "status": "completed",
-               "parameterCount": 8, "createdAt": "…" } ],
-  "page": 1, "limit": 20, "total": 12 }
+{ "statusCode": 422, "code": "OCR_LOW_CONFIDENCE",
+  "message": "The scan quality is too low to read reliably (OCR confidence 69%, minimum 70%). Please upload a clearer scan.",
+  "documentId": "…", "stage": "ocr", "retryable": true, "path": "/api/documents/upload", "timestamp": "…" }
 ```
 
-Other endpoints follow the HLD (section 8): `GET /:id`, `GET /:id/raw-text`, `GET /:id/file`, `POST /:id/reprocess`, `DELETE /:id`, `GET /health`.
+### `GET /api/documents?page=1&limit=20` → 200
+```json
+{ "items": [ { "id": "…", "fileName": "…", "status": "completed", "canRetry": false, "…": "…",
+               "report": { "reportId": "SMP-20481", "patientName": "…", "reportDate": "…", "labName": "…",
+                           "extractionMethod": "text", "idAutoGenerated": false, "parameterCount": 8 } } ],
+  "page": 1, "limit": 20, "total": 9 }
+```
+
+Other endpoints: `GET /api/documents/:id` (same shape as upload), `GET /api/documents/:id/file` (PDF), `POST /api/documents/:id/retry` (same shape as upload), `DELETE /api/documents/:id` (204), `GET /api/health` (`{ status: "ok", database: "up" }`).
 
 ---
 
@@ -696,99 +579,85 @@ Other endpoints follow the HLD (section 8): `GET /:id`, `GET /:id/raw-text`, `GE
 
 ### 10.1 `lib/api.ts`
 ```ts
-uploadReport(file: File, onProgress?: (pct: number) => void): Promise<ReportDetail>  // XMLHttpRequest for upload progress
-listReports(page = 1, limit = 20): Promise<Paginated<ReportSummary>>
-getReport(id: string): Promise<ReportDetail>
-getRawText(id: string): Promise<string>
-reprocessReport(id: string): Promise<ReportDetail>
-deleteReport(id: string): Promise<void>
-fileUrl(id: string): string                    // `${API}/reports/${id}/file`
-class ApiError extends Error { status; code; extra }
+api.list(page = 1, limit = 50): Promise<Paginated<DocumentSummary>>
+api.get(id): Promise<DocumentDetail>
+api.retry(id): Promise<DocumentDetail>
+api.remove(id): Promise<void>
+api.fileUrl(id): string                                   // `${API_URL}/documents/${id}/file`
+api.upload(file, onProgress): Promise<DocumentDetail>     // XMLHttpRequest, because fetch has no upload progress
+class ApiError extends Error { status; code; body }       // NETWORK_ERROR when the API cannot be reached
+formatDate(iso)                                           // en-IN format
 ```
+All requests use `cache: 'no-store'`.
 
 ### 10.2 Pages
-| Page | Type | Behaviour |
+| Route | Type | Behaviour |
 |---|---|---|
-| `/` (upload) | client component | `UploadDropzone`; on success → redirect to `/reports/[id]`; on 409 `DUPLICATE_FILE` → message with a link to the existing report |
-| `/reports` | client component | `ReportsTable` with pagination, status badges, delete button |
-| `/reports/[id]` | client component | `ReportHeader` + `StatusBanner` + two-column grid: `PdfViewer` (left) and `ParametersTable` (right); stacks vertically on small screens |
+| `/` | client page | `UploadCard` + `DocumentsTable`; loads the list on mount and after every upload or action |
+| `/documents/[id]` | server page wrapping a client view in `<Suspense>` | Required by `cacheComponents`: `useParams` suspends for dynamic ids |
 
 ### 10.3 Components
-| Component | Props | Notes |
-|---|---|---|
-| `UploadDropzone` | `onUploaded(report)` | States: `idle → uploading (progress %) → processing ("Reading PDF… scanned PDFs can take up to 30 s") → error`. Client-side check: `.pdf` and ≤ 10 MB before sending. |
-| `ReportsTable` | `items, onDelete` | Columns: Report ID, Patient, Date, Lab, Params, Method, Status, Uploaded |
-| `ReportHeader` | `report` | Report ID (+ "auto-generated" badge), patient, date, lab, method, pages |
-| `StatusBanner` | `status, failureReason, warnings, onReprocess` | green / yellow `needs_review` / red `extraction_failed` with Reprocess button |
-| `ParametersTable` | `parameters` | Columns: Test, Result, Unit, Reference Range. Section rows span the full width. `H`/`L` → red/blue + arrow. Missing cell → "—". OCR confidence < 70 → dotted underline + tooltip. |
-| `PdfViewer` | `src` | `<iframe src={fileUrl(id)} />` |
-| `RawTextDialog` | `reportId` | Loads raw text on open, `<pre>` in a modal |
+| Component | Behaviour |
+|---|---|
+| `UploadCard` | Drag-and-drop or file picker; browser checks (`.pdf`, ≤ 10 MB); states `idle → uploading (%) → processing ("Reading … Scanned PDFs can take up to 30 seconds") → error`. On success it **resets to idle before** `router.push('/documents/<id>')` – Next.js keeps the previous page mounted, so going back would otherwise show the old spinner. Errors show the API message, with a link to the document for `DUPLICATE_FILE` or a failed extraction. |
+| `DocumentsTable` | Report ID (or file name) with method badge, patient, lab, report date, test count, status badge (with the error for failed rows), upload time, Retry (when `canRetry`) and Delete |
+| `DocumentView` | Title with status and "auto-generated ID" badge; Retry / Delete; red banner for failed documents; warning banners; details panel (patient, date, lab, tests, pages, method); **original PDF iframe (left) and `ParametersTable` (right)** on wide screens, stacked on small ones; processing history; raw text in a `<details>` |
+| `ParametersTable` | Rows in PDF order; section rows span the table; H in red with ▲, L in blue with ▼; OCR values < 80% confidence underlined with a tooltip; Method column only when present; empty cells as "—"; the normalised name shown in brackets when it differs |
+| `StatusBadge` / `MethodBadge` | completed / needs_review / failed / processing; TEXT / OCR / TEXT + OCR |
 
 ---
 
-## 11. Sample PDFs (`samples/generate-samples.js`, uses `pdfkit`)
+## 11. Sample PDFs (`samples/generate-samples.js`)
 
-| File | Layout / purpose |
+The script describes each report once and renders it either as a digital PDF (`pdfkit`) or as an image-only "scanned" PDF (`@napi-rs/canvas`, optional tilt, specks and blur). All patient data is fictional.
+
+| File | Purpose |
 |---|---|
-| `01-basic-8-params.pdf` | Test / Result / Unit / Reference Range |
-| `02-lipid-10-params.pdf` | H/L flags, `< 200` style ranges |
-| `03-cbc-12-params.pdf` | `Investigation / Observed Value / Units / Biological Ref. Interval` |
-| `04-different-layout.pdf` | Column order Name / Range / Value / Unit + `Method` column, `Lab No.` label |
-| `05-special-values.pdf` | `<5`, `>1000`, `Positive`, `Nil`, `Reactive` |
-| `06-missing-fields.pdf` | Rows without unit or range |
-| `07-no-report-id.pdf` | No ID → auto-generated |
-| `08-multipage-25-params.pdf` | Sections, wrapped names, repeated header, 3 pages |
-| `09-scanned-clean.pdf` | Image-only page (rendered from 01) |
-| `10-scanned-noisy.pdf` | Image-only, 1.5° tilt + noise + blur |
-| `11-not-a-pdf.pdf` | Text file renamed |
+| `01-basic-8-params.pdf` | Simple layout, 8 parameters |
+| `02-lipid-10-params-flags.pdf` | Printed H/L, `< 200` / `> 40` ranges, `19-Nov-2026` |
+| `03-cbc-12-params-other-headers.pdf` | `Investigation / Observed Value / Units / Biological Ref. Interval`, `Lab No.`, `1,85,000` |
+| `04-different-column-order-with-method.pdf` | Columns in another order + `Method`, `Accession No` |
+| `05-special-values.pdf` | `<5`, `>1000`, `Positive`, `Nil`, `Non Reactive`, `Trace`, `2-4` |
+| `06-missing-fields.pdf` | Missing values, units and ranges |
+| `07-no-report-id.pdf` | No Report/Sample ID |
+| `08-multipage-sections-27-params.pdf` | 2 pages, 8 sections, wrapped names, repeated header |
+| `09-scanned-clean.pdf` | Image-only page → OCR |
+| `10-scanned-tilted-noisy.pdf` | Tilted, specks, blur → fails safely |
+| `11-not-a-pdf.pdf` | Text file renamed to `.pdf` |
 | `12-corrupted.pdf` | Truncated PDF |
 
-Scanned samples: render the digital page with `pdfjs-dist` + `@napi-rs/canvas`, degrade with `sharp` (rotate, noise, blur), embed the PNG into a new PDF with `pdfkit`.
+---
+
+## 12. Tests
+
+`cd backend && npm test` runs **63 tests** (Vitest):
+
+| Suite | Tests | What it checks |
+|---|---|---|
+| `extraction/extraction.service.spec.ts` | 11 | The real engine on samples 01–10 and 12: row counts, report details, flags, special values, missing fields, Method column, multi-page sections, OCR, safe failure of the poor scan, corrupted file |
+| `extraction/parsing/business-rules.spec.ts` | 52 | Business rules BL-01…BL-52: value, range and flag parsing, value/unit split, OCR digit fixes, unit and name normalisation, dates, report ID labels, patient name, lab name, `AUTO-` IDs, header synonyms, column order, sections, wrapped names, junk rows, calculated flags, OCR row filtering, invalid ranges, extra columns, length limits |
+
+The full test case sheet (`docs/Test_Cases.xlsx`) lists 43 end-to-end test cases (API, UI in Chrome, database) and 66 business rules, with the result and the way each was verified.
 
 ---
 
-## 12. Test Plan
+## 13. Request Flow Summary
 
-### Unit tests (`backend/test/unit`)
-| Suite | Cases |
-|---|---|
-| `value-parser.spec.ts` | `13.5`, `1,50,000`, `<5`, `<= 5`, `>1000`, `Positive`, `Nil`, empty, `-` |
-| `range-parser.spec.ts` | `13 - 17`, `13.0–17.0`, `4 to 11`, `< 200`, `Up to 5`, `> 40`, `M: 13-17 F: 12-15`, `Negative` |
-| `metadata-parser.spec.ts` | each ID label, missing ID, date formats, invalid date |
-| `line-builder.spec.ts` | words at slightly different y on one line; two close lines kept apart |
-| `row-postprocessor.spec.ts` | section detection, wrapped name, `13.5g/dL` split, `128 H` flag, OCR `1O.5` → `10.5`, computed flag |
-| `header-table.strategy.spec.ts` | synonyms, different column order, repeated header on page 2, stop words |
-
-### E2E tests (`backend/test/e2e/reports.e2e-spec.ts`, Supertest against a test DB)
-| Case | Expected |
-|---|---|
-| Upload each sample 01–08 | 201, correct parameter count |
-| Upload 01 twice | second → 409 `DUPLICATE_FILE` |
-| Upload 07 | 201, `idAutoGenerated: true` |
-| Upload 09 | 201, `extractionMethod: "ocr"` |
-| Upload 11 | 400 `INVALID_FILE_TYPE` |
-| Upload 12 | 422 `CORRUPTED_PDF` |
-| No file | 400 `FILE_MISSING` |
-| `GET /reports/not-a-uuid` | 400 |
-| `DELETE` then `GET` | 204 then 404 |
-
----
-
-## 13. Implementation Order and Commit Plan
-
-| # | Step | Commit message | Est. |
-|---|---|---|---|
-| 1 | Repo, `.gitignore`, docs, folder skeleton | `chore: initial project structure and design docs` | 15 m |
-| 2 | Sample generator + PDFs | `feat(samples): generate sample lab report PDFs` | 45 m |
-| 3 | NestJS app, config, Prisma schema, migration, health | `feat(backend): nestjs setup with prisma schema` | 40 m |
-| 4 | Errors, filter, logger middleware, validation pipe | `feat(backend): error handling, logging and upload validation` | 30 m |
-| 5 | PDF loader + text extractor + line builder | `feat(extraction): read pdf text with positions` | 40 m |
-| 6 | Value/range/metadata parsers + unit tests | `feat(parsing): value, range and metadata parsers` | 50 m |
-| 7 | Header strategy, regex strategy, post-processor, table parser + tests | `feat(parsing): table detection for varying layouts` | 80 m |
-| 8 | Page renderer, preprocessor, Tesseract provider, retry | `feat(ocr): tesseract ocr for scanned pages with retry` | 60 m |
-| 9 | Storage, repository, service, controller | `feat(reports): upload, list, detail, reprocess, delete api` | 50 m |
-| 10 | Next.js app: upload, list, detail pages | `feat(frontend): upload and report views` | 90 m |
-| 11 | E2E tests | `test: e2e tests for upload edge cases` | 30 m |
-| 12 | README | `docs: readme with design, edge cases and setup` | 30 m |
-
-**Cut order if time runs short:** throttler → e2e tests → reprocess endpoint → raw-text dialog → OCR retry (keep single attempt + `extraction_failed`).
+```
+POST /api/documents/upload
+  → RequestLoggerMiddleware → helmet / CORS
+  → FileInterceptor (Multer, memory, 10 MB)
+  → PdfFilePipe
+  → DocumentsController.upload
+  → DocumentsService.upload
+       sha256 → duplicate check → FileStorageService.save → INSERT document
+       → runAttempt
+            INSERT attempt
+            → ExtractionService.extract
+                 loadPdf → extractPageWords / (renderPage → TesseractOcrProvider) → buildLines
+                 → parseTable (headerStrategy + linePatternStrategy → cleanRows → score)
+                 → parseMetadata
+            → TRANSACTION: report + parameters + attempt success + document status
+  → toDocumentDetail → 201 JSON
+errors anywhere → AllExceptionsFilter → { statusCode, code, message, … }
+```

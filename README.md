@@ -140,7 +140,7 @@ Open <http://localhost:3000> and upload any file from [`samples/`](samples).
 ### Tests
 ```bash
 cd backend
-npm test                    # runs the extraction engine on every sample PDF
+npm test                    # 63 tests: every sample PDF + 52 business-rule unit tests
 ```
 
 ### Regenerate the sample PDFs (optional)

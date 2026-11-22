@@ -37,6 +37,9 @@ export function UploadCard({ onUploaded }: { onUploaded: () => void }) {
       const doc = await api.upload(file, (percent) =>
         setState(percent < 100 ? { kind: 'uploading', percent, fileName: file.name } : { kind: 'processing', fileName: file.name }),
       );
+      // Reset before leaving: Next.js keeps this page mounted in the background, so going
+      // back would otherwise show the old "Reading..." state again.
+      setState({ kind: 'idle' });
       onUploaded();
       router.push(`/documents/${doc.id}`);
     } catch (e) {

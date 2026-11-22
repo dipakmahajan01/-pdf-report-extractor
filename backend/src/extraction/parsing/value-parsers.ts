@@ -52,7 +52,7 @@ export function splitFlag(raw: string): { value: string; flag?: 'H' | 'L' } {
 
 /** "13.5g/dL" -> { value: "13.5", unit: "g/dL" }. */
 export function splitValueUnit(raw: string): { value: string; unit?: string } {
-  const m = raw.trim().match(/^([<>]=?\s*\d[\d.,]*)\s*([A-Za-zµ%/][A-Za-zµ%/^.\d]*)$/);
+  const m = raw.trim().match(/^((?:[<>]=?)?\s*\d[\d.,]*)\s*([A-Za-zµμ%/][A-Za-zµμ%/^.\d]*)$/);
   if (!m || !isUnit(m[2])) return { value: raw.trim() };
   return { value: m[1].trim(), unit: m[2] };
 }

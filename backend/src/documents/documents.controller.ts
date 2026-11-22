@@ -50,6 +50,8 @@ export class DocumentsController {
   async file(@Param('id', ParseUUIDPipe) id: string, @Res() res: Response) {
     const { document, stream } = await this.documents.getFile(id);
     res.setHeader('Content-Type', 'application/pdf');
+    // Only restrict who may embed it; the full API policy can stop the browser's PDF viewer from rendering.
+    res.setHeader('Content-Security-Policy', `frame-ancestors 'self' ${process.env.FRONTEND_URL ?? 'http://localhost:3000'}`);
     res.setHeader('Content-Disposition', `inline; filename="${encodeURIComponent(document.fileName)}"`);
     stream.pipe(res);
   }

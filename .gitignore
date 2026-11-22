@@ -5,6 +5,7 @@ node_modules/
 dist/
 .next/
 coverage/
+*.tsbuildinfo
 
 # secrets
 .env
@@ -12,6 +13,10 @@ coverage/
 
 # uploaded PDFs (runtime data)
 backend/storage/
+
+# AI agent skill files installed by the Nest CLI (local tooling only)
+backend/.agents/
+backend/.claude/
 
 # logs
 *.log

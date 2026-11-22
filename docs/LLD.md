@@ -13,6 +13,13 @@ This document turns the [HLD](./HLD.md) into concrete files, classes, method sig
 | Frontend | Next.js 14 (App Router) · Tailwind CSS |
 | Tests | Jest (unit + e2e with Supertest) |
 
+
+> **Implementation notes (final build vs. this plan)**
+> - **TypeORM** replaced Prisma: npm resolved a Prisma 8 release candidate with a mismatched 7.x client. The schema is a plain-SQL migration in `backend/src/database/migrations`.
+> - The schema has **4 tables**: `documents` (uploaded file + retry state) and `extraction_attempts` (history of every run) were added in front of `reports` / `report_parameters`, so a failed PDF can be retried without re-uploading. Endpoints are under `/api/documents`.
+> - `report_parameters.name_normalized` was added for test-name normalisation.
+> - OCR uses the `eng` model from the `@tesseract.js-data/eng` package (no separate `tessdata/` folder, no `sharp`); image clean-up is done on the canvas.
+> - Tests use **Vitest** (NestJS 12 is ESM-only). The gap-detection strategy and rate limiting are listed as future improvements.
 ---
 
 ## 1. Repository Layout

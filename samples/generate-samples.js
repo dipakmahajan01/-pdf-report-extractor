@@ -417,7 +417,7 @@ renderDigital(differentLayout, '04-different-column-order-with-method.pdf');
 renderDigital(specialValues, '05-special-values.pdf');
 renderDigital(missingFields, '06-missing-fields.pdf');
 renderDigital(noReportId, '07-no-report-id.pdf');
-renderDigital(multiPage, '08-multipage-sections-33-params.pdf');
+renderDigital(multiPage, '08-multipage-sections-27-params.pdf');
 renderScanned(scannedClean, '09-scanned-clean.pdf', { dpi: 200 });
 renderScanned(scannedNoisy, '10-scanned-tilted-noisy.pdf', { dpi: 150, tiltDeg: 1.2, noise: 6000, blur: 0.6 });
 

@@ -23,3 +23,6 @@ backend/.claude/
 
 # assignment brief (not part of the solution)
 Technical_Assignment_Full_Stack.pdf
+
+# local debugging scratch
+backend/tmp/
